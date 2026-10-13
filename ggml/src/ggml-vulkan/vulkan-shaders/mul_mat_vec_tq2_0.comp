@@ -1,0 +1,82 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// TQ2_0 ternary weights: 256 elements per block, 2 bits each, value = (q - 1) * d.
+// Block layout mirrors block_tq2_0 in ggml/src/ggml-common.h: qs[64] then d.
+// Element order matches dequantize_row_tq2_0 in ggml/src/ggml-quants.c:
+// byte bi holds elements (bi/32)*128 + l*32 + bi%32 for l = 0..3 (2 bits each).
+//
+// 32 threads (pinned host-side). Thread t loads one 16-bit word per block (bytes 2t, 2t+1,
+// i.e. 8 weights) and pairs it with 4 vec2 activation loads; the scale is applied once per
+// block. Rows are reduced with the shared-memory reduction in mul_mat_vec_base.
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint num_blocks_per_row = p.ncols / 256u;
+
+    // bytes 2t and 2t+1 share a 32-byte half, so their elements are adjacent
+    const uint e0 = (tid / 16u) * 128u + (2u * tid) % 32u;
+
+    for (uint blk = 0; blk < num_blocks_per_row; blk++) {
+        uint  w[NUM_ROWS];
+        float d[NUM_ROWS];
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            if (n < num_rows) {
+                const uint ib = a_offset + (first_row + n) * num_blocks_per_row + blk;
+                w[n] = uint(data_a_packed16[ib].qs[tid]);
+                d[n] = float(data_a_packed16[ib].d);
+            }
+        }
+
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            const uint bb = c * p.batch_stride_b + b_offset + blk * 256u + e0;
+            vec2 bv[4];
+            [[unroll]] for (uint l = 0; l < 4u; ++l) {
+                bv[l] = vec2(data_b_v2[(bb + l * 32u) / 2u]);
+            }
+
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    float s = 0.0;
+                    [[unroll]] for (uint l = 0; l < 4u; ++l) {
+                        s += (float((w[n] >> (2u * l))      & 3u) - 1.0) * bv[l].x;
+                        s += (float((w[n] >> (8u + 2u * l)) & 3u) - 1.0) * bv[l].y;
+                    }
+                    temp[c][n] += FLOAT_TYPE(s * d[n]);
+                }
+            }
+        }
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
