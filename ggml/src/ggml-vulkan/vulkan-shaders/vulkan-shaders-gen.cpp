@@ -1293,6 +1293,16 @@ void process_shaders() {
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
+    // LFM2 single-token decode fusion kernels
+    string_to_spv("lfm2_conv_f32", "lfm2_conv.comp", {});
+    string_to_spv("lfm2_router_f32", "lfm2_router.comp", {});
+    string_to_spv("lfm2_moe_gateup_q4k_q4k", "lfm2_moe_gateup.comp", {});
+    string_to_spv("lfm2_moe_gateup_q5k_q4k", "lfm2_moe_gateup.comp", {{"GATE_Q5", "1"}});
+    string_to_spv("lfm2_moe_gateup_q4k_q5k", "lfm2_moe_gateup.comp", {{"UP_Q5", "1"}});
+    string_to_spv("lfm2_moe_gateup_q5k_q5k", "lfm2_moe_gateup.comp", {{"GATE_Q5", "1"}, {"UP_Q5", "1"}});
+    string_to_spv("lfm2_moe_down_q4k", "lfm2_moe_down.comp", {});
+    string_to_spv("lfm2_moe_down_q5k", "lfm2_moe_down.comp", {{"DOWN_Q5", "1"}});
+
     // MoE expert cache matvec variants (Q8_0/Q4_0/Q4_K/Q6_K/Q5_K weights).
     // Compiled separately per weight type; see moe_cache_mv.comp.
     string_to_spv("moe_cache_mv_q8_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "1"}});

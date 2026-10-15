@@ -1,0 +1,101 @@
+#version 450
+
+// Fused MoE down projection for single-token decode:
+//   d[r] = resid[r] + sum_e w[e] * dot(down[ids[e]][r], h[e])
+// Replaces MUL_MAT_ID + MUL (expert weights) + CONT + SUM_ROWS + ADD (residual).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;            // K, a multiple of 256
+    uint nrows;
+    uint blocks_per_expert;
+    uint n_used;
+    uint x_stride;         // input elements per expert slot
+} p;
+
+#ifdef DOWN_Q5
+#define DOWN_T   block_q5_K
+#define DOWN_T16 block_q5_K_packed16
+#define DOWN_T32 block_q5_K_packed32
+#else
+#define DOWN_T   block_q4_K
+#define DOWN_T16 block_q4_K_packed16
+#define DOWN_T32 block_q4_K_packed32
+#endif
+
+layout (binding = 0) readonly buffer A   {DOWN_T   data_a[];};
+layout (binding = 0) readonly buffer A16 {DOWN_T16 data_a16[];};
+layout (binding = 0) readonly buffer A32 {DOWN_T32 data_a32[];};
+layout (binding = 1) readonly buffer X   {float data_x[];};
+layout (binding = 1) readonly buffer XV2 {vec2 data_x_v2[];};
+layout (binding = 1) readonly buffer XV4 {vec4 data_x_v4[];};
+layout (binding = 2) readonly buffer IDS {int data_ids[];};
+layout (binding = 3) readonly buffer W   {float data_w[];};
+layout (binding = 4) readonly buffer R   {float data_r[];};
+layout (binding = 5) writeonly buffer D  {float data_d[];};
+
+#define LFM2_X4(i) data_x_v4[(i) / 4]
+#define LFM2_X2(i) data_x_v2[(i) / 2]
+
+#define KQ_NAME dot_down
+#define KQ_A    data_a
+#define KQ_A16  data_a16
+#define KQ_A32  data_a32
+#ifdef DOWN_Q5
+#define KQ_Q5
+#endif
+#include "lfm2_kq_dot.glsl"
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const uint NUM_ROWS = 2;
+
+void main() {
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint nb = p.ncols / 256;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 16;
+    const uint ix = tid / 16;
+    const uint it_size = gl_WorkGroupSize.x / 16;
+
+    float acc[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        acc[n] = 0.0;
+    }
+
+    for (uint e = 0; e < p.n_used; ++e) {
+        const uint expert = uint(data_ids[e]);
+        const float w = data_w[e];
+        const uint xbase = e * p.x_stride;
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint row = min(first_row + n, p.nrows - 1);
+            const uint ib0 = expert * p.blocks_per_expert + row * nb;
+            float t = 0.0;
+            for (uint i = ix; i < nb; i += it_size) {
+                t += dot_down(ib0 + i, xbase + i * 256, itid);
+            }
+            acc[n] = fma(w, t, acc[n]);
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        acc[n] = subgroupAdd(acc[n]);
+    }
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint row = first_row + n;
+            if (row < p.nrows) {
+                data_d[row] = data_r[row] + acc[n];
+            }
+        }
+    }
+}

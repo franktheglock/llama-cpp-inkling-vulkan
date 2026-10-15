@@ -1,0 +1,1555 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 58f57a6..52b6d97 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -94,6 +94,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-vulkan-shaders.hpp"
++#include <execinfo.h>
+ 
+ extern "C" void ggml_vulkan_moe_cache_register(void * reg);
+ 
+@@ -1099,6 +1100,13 @@ struct vk_device_struct {
+     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
+     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
+ 
++    // LFM2 single-token decode fusion (see ggml_vk_lfm2_analyze)
++    vk_pipeline pipeline_lfm2_conv;
++    vk_pipeline pipeline_lfm2_router;
++    vk_pipeline pipeline_lfm2_gateup[2][2]; // [gate is q5_K][up is q5_K]
++    vk_pipeline pipeline_lfm2_down[2];      // [down is q5_K]
++    uint32_t lfm2_fusion_mask {};           // bit per lfm2_fuse_kind, 0 = disabled
++
+     std::vector<vk_pipeline_ref> all_pipelines;
+ 
+     std::vector<std::tuple<void*, size_t, vk_buffer>> pinned_memory;
+@@ -2337,6 +2345,42 @@ class vk_perf_logger {
+     uint32_t print_count {};
+ };
+ 
++// LFM2 single-token decode fusion. A group is a set of graph nodes that one
++// kernel computes; the kernel is emitted at the group's anchor node and the
++// other nodes are elided. Groups are found structurally (by walking srcs), so
++// they don't depend on the nodes being consecutive in the graph.
++enum lfm2_fuse_kind : uint8_t {
++    LFM2_FUSE_NONE = 0,
++    LFM2_FUSE_ELIDE,     // node is computed by another node's kernel
++    LFM2_FUSE_CONV,      // shortconv: MUL + GET_ROWS + CONCAT + CPY + SSM_CONV + MUL
++    LFM2_FUSE_ROUTER,    // RMS_NORM + MUL + MUL_MAT (router logits)
++    LFM2_FUSE_GATEUP,    // MUL_MAT_ID x2 + GLU
++    LFM2_FUSE_DOWN,      // MUL_MAT_ID + MUL + CONT + SUM_ROWS + ADD
++    LFM2_FUSE_MMV_ADD,   // MUL_MAT + (RESHAPE) + ADD
++};
++
++struct lfm2_fuse_group {
++    lfm2_fuse_kind kind = LFM2_FUSE_NONE;
++    int anchor = -1;
++    int first = -1;                       // lowest elided node index
++    int mm_idx = -1;                      // MMV_ADD: index of the MUL_MAT node
++    std::vector<int> elided;
++    std::vector<const ggml_tensor *> in;  // kernel inputs, in binding order
++    std::vector<const ggml_tensor *> out; // kernel outputs, in binding order
++    std::vector<bool> in_persistent;      // input is a weight/leaf that is never reallocated
++    int inplace_ok = -1;                  // index into `in` that may exactly alias out[0]
++    uint32_t u[6] {};
++    float f[3] {};
++};
++
++struct lfm2_fuse_plan {
++    uint64_t fingerprint = 0;
++    bool valid = false;
++    std::vector<uint8_t> role;            // lfm2_fuse_kind per node
++    std::vector<int> group_of;            // group index per anchor node
++    std::vector<lfm2_fuse_group> groups;
++};
++
+ struct ggml_backend_vk_context {
+     std::string name;
+ 
+@@ -2397,6 +2441,12 @@ struct ggml_backend_vk_context {
+     topk_moe_mode fused_topk_moe_mode {};
+     bool fused_topk_moe_scale {};
+ 
++    lfm2_fuse_plan lfm2_plan;
++    uint32_t lfm2_last_submit_count {};
++    const lfm2_fuse_group * lfm2_cur {};          // group being emitted by ggml_vk_build_graph
++    const ggml_tensor * lfm2_mmv_dst {};          // MMV_ADD: write the mat-vec result here
++    const ggml_tensor * lfm2_mmv_bias {};         // MMV_ADD: bias to add
++
+     // for GGML_VK_PERF_LOGGER
+     std::unique_ptr<vk_perf_logger> perf_logger;
+     vk::QueryPool query_pool;
+@@ -2619,7 +2669,10 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+             GGML_LOG_ERROR("ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+             throw vk::SystemError(vk::make_error_code(result), "ggml_vulkan: getFenceStatus");
+         }
+-        for (uint32_t i = 0; i < 100; ++i) {
++        // Poll often: the tail of a decode step is a few microseconds of work, and every
++        // microsecond the CPU notices late is GPU idle time before the next token.
++        static const uint32_t spin = getenv("GGML_VK_FENCE_SPIN") ? (uint32_t)std::max(1, atoi(getenv("GGML_VK_FENCE_SPIN"))) : 4u;
++        for (uint32_t i = 0; i < spin; ++i) {
+             YIELD();
+             YIELD();
+             YIELD();
+@@ -5224,6 +5277,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         rm_stdq = 2;
+         rm_stdq_int = 2;
+     }
++    if (const char * e = getenv("GGML_VK_RM_KQ"))   { rm_kq   = std::max(1, atoi(e)); }
++    if (const char * e = getenv("GGML_VK_RM_STDQ")) { rm_stdq = std::max(1, atoi(e)); }
+     uint32_t rm_iq = 2 * rm_kq;
+ 
+     const bool use_subgroups = device->subgroup_arithmetic;
+@@ -5232,7 +5287,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     // Ensure a subgroup size >= 16 is available
+     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
+ 
+-    const uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
++    const uint32_t subgroup_size = getenv("GGML_VK_DMMV_SUBGROUP") ? (uint32_t)atoi(getenv("GGML_VK_DMMV_SUBGROUP")) :
++        (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
+     const uint32_t subgroup_size16 = std::max(subgroup_size, 16u);
+ 
+     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
+@@ -5991,6 +6047,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
+     }
+ 
++    {
++        // LFM2 single-token decode fusion. The K-quant kernels reduce with subgroupAdd over
++        // a workgroup that is exactly one subgroup, 16 threads per 256-weight block.
++        uint32_t mask = 0;
++        if (use_subgroups16 && force_subgroup_size16 != 0 && subgroup_size16 % 16 == 0 &&
++            !device->disable_fusion && getenv("GGML_VK_DISABLE_LFM2_FUSION") == nullptr) {
++            mask = ~0u;
++            if (const char * e = getenv("GGML_VK_LFM2_FUSION_MASK")) {
++                mask = (uint32_t)strtoul(e, nullptr, 0);
++            }
++        }
++        device->lfm2_fusion_mask = mask;
++        const uint32_t lfm2_rows = getenv("GGML_VK_LFM2_ROWS") ? (uint32_t)std::max(1, atoi(getenv("GGML_VK_LFM2_ROWS"))) : 1u;
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_conv,   "lfm2_conv_f32",   lfm2_conv_f32_len,   lfm2_conv_f32_data,   "main", 6, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_router, "lfm2_router_f32", lfm2_router_f32_len, lfm2_router_f32_data, "main", 5, 4 * sizeof(uint32_t), {1, 1, 1}, {subgroup_size16}, 1, true, true, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_gateup[0][0], "lfm2_moe_gateup_q4k_q4k", lfm2_moe_gateup_q4k_q4k_len, lfm2_moe_gateup_q4k_q4k_data, "main", 5, 5 * sizeof(uint32_t), {lfm2_rows, 1, 1}, {subgroup_size16, lfm2_rows}, 1, true, true, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_gateup[1][0], "lfm2_moe_gateup_q5k_q4k", lfm2_moe_gateup_q5k_q4k_len, lfm2_moe_gateup_q5k_q4k_data, "main", 5, 5 * sizeof(uint32_t), {lfm2_rows, 1, 1}, {subgroup_size16, lfm2_rows}, 1, true, true, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_gateup[0][1], "lfm2_moe_gateup_q4k_q5k", lfm2_moe_gateup_q4k_q5k_len, lfm2_moe_gateup_q4k_q5k_data, "main", 5, 5 * sizeof(uint32_t), {lfm2_rows, 1, 1}, {subgroup_size16, lfm2_rows}, 1, true, true, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_gateup[1][1], "lfm2_moe_gateup_q5k_q5k", lfm2_moe_gateup_q5k_q5k_len, lfm2_moe_gateup_q5k_q5k_data, "main", 5, 5 * sizeof(uint32_t), {lfm2_rows, 1, 1}, {subgroup_size16, lfm2_rows}, 1, true, true, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_down[0], "lfm2_moe_down_q4k", lfm2_moe_down_q4k_len, lfm2_moe_down_q4k_data, "main", 6, 5 * sizeof(uint32_t), {lfm2_rows, 1, 1}, {subgroup_size16, lfm2_rows}, 1, true, true, force_subgroup_size16);
++        ggml_vk_create_pipeline(device, device->pipeline_lfm2_down[1], "lfm2_moe_down_q5k", lfm2_moe_down_q5k_len, lfm2_moe_down_q5k_data, "main", 6, 5 * sizeof(uint32_t), {lfm2_rows, 1, 1}, {subgroup_size16, lfm2_rows}, 1, true, true, force_subgroup_size16);
++    }
++
+     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+@@ -7928,6 +8007,15 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         }
+     }
+ 
++    {
++        static const int force_large = getenv("GGML_VK_DMMV_LARGE") ? atoi(getenv("GGML_VK_DMMV_LARGE")) : 0;
++        if (force_large == 1 && m <= 8192 && k >= 1024) {
++            dmmv_wg = DMMV_WG_SIZE_LARGE;
++        } else if (force_large == 2) {
++            dmmv_wg = DMMV_WG_SIZE_LARGE;
++        }
++    }
++
+     // TurboQuant weight types are created with a fixed 32-thread workgroup for
+     // every DMMV_WG_SIZE_* class, so the size class cannot change the pipeline
+     // today. Pin it anyway: the shader is only correct at 32 threads, and this
+@@ -9750,7 +9838,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         }
+     }
+ 
+-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
++    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, ctx->lfm2_mmv_dst ? ctx->lfm2_mmv_dst : cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
+     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
+     vk_subbuffer d_X, d_Y;
+@@ -9829,6 +9917,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     uint32_t fusion_flags = 0;
+ 
+     vk_subbuffer d_F0 = d_D;
++    if (ctx->lfm2_mmv_bias) {
++        GGML_ASSERT(ctx->num_additional_fused_ops == 0);
++        d_F0 = ggml_vk_tensor_subbuffer(ctx, ctx->lfm2_mmv_bias);
++        fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
++    }
+     if (ctx->num_additional_fused_ops > 0) {
+         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
+@@ -15411,10 +15504,112 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
+     }
+ }
+ 
++// GGML_VK_TIMING=1: coarse CPU-side timeline of each decode step
++struct vk_timing_stats {
++    bool enabled = getenv("GGML_VK_TIMING") != nullptr;
++    std::chrono::steady_clock::time_point last_end {};
++    double record_us = 0, wait_us = 0, between_us = 0, sync_us = 0;
++    std::chrono::steady_clock::time_point graph_start {};
++    std::vector<std::pair<double, int>> submit_at;
++    uint64_t graphs = 0, syncs = 0, waits = 0;
++    static double us(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
++        return std::chrono::duration<double, std::micro>(b - a).count();
++    }
++};
++static vk_timing_stats vk_timing;
++
+ static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
+ 
+ // Returns true if node has enqueued work into the queue, false otherwise
+ // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
++struct vk_lfm2_conv_push_constants {
++    uint32_t n;
++    uint32_t rs_stride;
++};
++
++struct vk_lfm2_router_push_constants {
++    uint32_t n;
++    uint32_t n_expert;
++    float eps;
++    uint32_t xn_chunk;
++};
++
++struct vk_lfm2_moe_push_constants {
++    uint32_t ncols;
++    uint32_t nrows;
++    uint32_t blocks_per_expert;
++    uint32_t n_used;
++    uint32_t stride;
++};
++
++static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
++
++// Emit the kernel for one LFM2 fusion group (see ggml_vk_lfm2_analyze).
++static void ggml_vk_lfm2_dispatch(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, const lfm2_fuse_group & g) {
++    // A group always depends on the stage before it, so synchronize unconditionally.
++    ctx->unsynced_nodes_written.clear();
++    ctx->unsynced_nodes_read.clear();
++    ggml_vk_sync_buffers(ctx, subctx);
++
++    auto sb = [&](const ggml_tensor * t) { return ggml_vk_tensor_subbuffer(ctx, t); };
++
++    switch (g.kind) {
++    case LFM2_FUSE_CONV: {
++        vk_pipeline pipeline = ctx->device->pipeline_lfm2_conv;
++        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++        const vk_lfm2_conv_push_constants pc = { g.u[0], g.u[1] };
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++            { sb(g.in[0]), sb(g.in[1]), sb(g.in[2]), sb(g.in[3]), sb(g.out[0]), sb(g.out[1]) },
++            pc, { g.u[0], 1, 1 });
++        break;
++    }
++    case LFM2_FUSE_ROUTER: {
++        vk_pipeline pipeline = ctx->device->pipeline_lfm2_router;
++        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++        const vk_lfm2_router_push_constants pc = { g.u[0], g.u[1], g.f[0], g.u[2] };
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++            { sb(g.in[0]), sb(g.in[1]), sb(g.in[2]), sb(g.out[0]), sb(g.out[1]) },
++            pc, { g.u[1], 1, 1 });
++        break;
++    }
++    case LFM2_FUSE_GATEUP: {
++        vk_pipeline pipeline = ctx->device->pipeline_lfm2_gateup[g.u[4]][g.u[5]];
++        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++        const vk_lfm2_moe_push_constants pc = { g.u[0], g.u[1], g.u[1] * (g.u[0] / 256), g.u[2], g.u[1] };
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++            { sb(g.in[0]), sb(g.in[1]), sb(g.in[2]), sb(g.in[3]), sb(g.out[0]) },
++            pc, { g.u[1], g.u[2], 1 });
++        break;
++    }
++    case LFM2_FUSE_DOWN: {
++        vk_pipeline pipeline = ctx->device->pipeline_lfm2_down[g.u[4]];
++        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++        const vk_lfm2_moe_push_constants pc = { g.u[0], g.u[1], g.u[1] * (g.u[0] / 256), g.u[2], g.u[0] };
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++            { sb(g.in[0]), sb(g.in[1]), sb(g.in[2]), sb(g.in[3]), sb(g.in[4]), sb(g.out[0]) },
++            pc, { g.u[1], 1, 1 });
++        break;
++    }
++    case LFM2_FUSE_MMV_ADD: {
++        ctx->lfm2_mmv_dst = g.out[0];
++        ctx->lfm2_mmv_bias = g.in[2];
++        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, g.mm_idx);
++        ctx->lfm2_mmv_dst = nullptr;
++        ctx->lfm2_mmv_bias = nullptr;
++        break;
++    }
++    default:
++        GGML_ABORT("unexpected lfm2 fusion kind");
++    }
++
++    for (const ggml_tensor * t : g.out) {
++        ctx->unsynced_nodes_written.push_back(t);
++    }
++    for (const ggml_tensor * t : g.in) {
++        ctx->unsynced_nodes_read.push_back(t);
++    }
++}
++
+ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
+     ggml_tensor * node = cgraph->nodes[node_idx];
+     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
+@@ -15432,10 +15627,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+     ggml_tensor * src2 = node->src[2];
+     ggml_tensor * src3 = node->src[3];
+ 
+-    if (node->op == GGML_OP_ADD) {
++    // (an lfm2 fusion anchor that happens to be an ADD doesn't run the add shader, so it can't produce rms partials)
++    if (node->op == GGML_OP_ADD && !ctx->lfm2_cur) {
+         int next_node_idx = node_idx + 1 + ctx->num_additional_fused_ops;
+         if (next_node_idx < cgraph->n_nodes &&
+             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
++            ctx->lfm2_plan.role[next_node_idx] != LFM2_FUSE_ELIDE &&
+             cgraph->nodes[next_node_idx]->src[0] == cgraph->nodes[next_node_idx - 1] &&
+             ggml_nrows(cgraph->nodes[next_node_idx]) == 1 &&
+             ctx->device->add_rms_fusion) {
+@@ -15449,6 +15646,19 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+ 
++    if (ctx->lfm2_cur) {
++        ggml_vk_lfm2_dispatch(ctx, compute_ctx, cgraph, *ctx->lfm2_cur);
++
++        ctx->tensor_ctxs[node_idx] = compute_ctx;
++        if (submit || last_node) {
++            ggml_vk_ctx_end(compute_ctx);
++            compute_ctx->exit_tensor_idx = last_node ? node_idx_begin : -1;
++            ctx->compute_ctx.reset();
++            ggml_vk_compute_forward(ctx, cgraph, node_begin, node_idx_begin, almost_ready);
++        }
++        return true;
++    }
++
+     {
+         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
+         // to synchronize them. This handles most "normal" synchronization when computing the graph, and when
+@@ -15980,6 +16190,9 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
+             ggml_vk_submit(subctx, {});
+         }
+         ctx->submit_pending = true;
++        if (vk_timing.enabled) {
++            vk_timing.submit_at.push_back({ vk_timing_stats::us(vk_timing.graph_start, std::chrono::steady_clock::now()), tensor_idx });
++        }
+ 
+ #ifdef GGML_VULKAN_CHECK_RESULTS
+         ggml_vk_synchronize(ctx);
+@@ -16149,6 +16362,7 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
+ 
+ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
++    if (vk_timing.enabled && vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: +%.0fus ", vk_timing_stats::us(vk_timing.last_end, std::chrono::steady_clock::now())); fprintf(stderr, "set_sync %s %zu\n", tensor->name, size); }
+     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+     vk_buffer buf = buf_ctx->dev_buffer;
+ 
+@@ -16175,6 +16389,7 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
+ 
+ static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
++    if (vk_timing.enabled && vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: +%.0fus ", vk_timing_stats::us(vk_timing.last_end, std::chrono::steady_clock::now())); fprintf(stderr, "get_sync %s %zu\n", tensor->name, size); }
+     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+ 
+     if (size == 0) {
+@@ -16390,6 +16605,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
+                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
++    if (vk_timing.enabled && vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: +%.0fus ", vk_timing_stats::us(vk_timing.last_end, std::chrono::steady_clock::now())); fprintf(stderr, "set_async %s %zu x %zu\n", tensor->name, size, n_copies); }
+     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+ 
+     if (size == 0) {
+@@ -16453,6 +16669,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
+                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
++    if (vk_timing.enabled && vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: +%.0fus ", vk_timing_stats::us(vk_timing.last_end, std::chrono::steady_clock::now())); fprintf(stderr, "get_async %s %zu x %zu\n", tensor->name, size, n_copies); }
+     GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+ 
+     if (size == 0) {
+@@ -16461,11 +16678,27 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
+ 
+     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+ 
+-    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+-
+     vk_buffer buf = buf_ctx->dev_buffer;
+ 
+     auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
++
++    // Small readbacks (sampled token, a few candidate probabilities) from host-visible VRAM:
++    // wait for the graph, then read straight through the mapping. The kernel writes the GPU
++    // caches back to memory when it signals a job's fence, so this is coherent once
++    // synchronize() returns, and it avoids a copy-to-staging submit + wait per tensor.
++    static const bool direct_read = getenv("GGML_VK_DISABLE_DIRECT_READ") == nullptr;
++    if (direct_read && !ctx->device->uma && buf->ptr != nullptr && size * n_copies <= 16384 &&
++        (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
++        (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
++        ggml_vk_synchronize(ctx);
++        for (size_t i = 0; i < n_copies; i++) {
++            memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)buf->ptr + src_offset + i * stride_tensor, size);
++        }
++        return;
++    }
++
++    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
++
+     bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
+ 
+     if (!ret) {
+@@ -16538,6 +16771,19 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
+     }
+ 
+     if (ggml_backend_buffer_is_host(src->buffer)) {
++        // Small host -> VRAM copies into host-visible memory: write through the mapping now.
++        // The scheduler has already waited for this backend to finish with dst, and going
++        // through the transfer queue costs a submit + semaphore handshake + wait per decode step.
++        static const bool direct_write = getenv("GGML_VK_DISABLE_DIRECT_WRITE") == nullptr;
++        if (direct_write && !ctx->device->uma && dst_buf->ptr != nullptr && ggml_nbytes(src) <= 1024 * 1024 &&
++            (dst_buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
++            (dst_buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent) &&
++            ctx->compute_ctx.expired() && ctx->transfer_ctx.expired() && !ctx->submit_pending) {
++            if (vk_timing.enabled && vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: direct cpy %s %zu\n", dst->name, ggml_nbytes(src)); }
++            memcpy((uint8_t *)dst_buf->ptr + vk_tensor_offset(dst) + dst->view_offs, src->data, ggml_nbytes(src));
++            return true;
++        }
++
+         vk_buffer pinned_buf = nullptr;
+         size_t pinned_offset = 0;
+         ggml_vk_host_get(ctx->device, src->data, pinned_buf, pinned_offset);
+@@ -16563,6 +16809,11 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
+ 
+ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+     VK_LOG_DEBUG("ggml_vk_synchronize()");
++    const auto timing_t0 = std::chrono::steady_clock::now();
++    struct timing_scope {
++        std::chrono::steady_clock::time_point t0;
++        ~timing_scope() { if (vk_timing.enabled) { vk_timing.sync_us += vk_timing_stats::us(t0, std::chrono::steady_clock::now()); vk_timing.syncs++; } }
++    } timing_scope_guard { timing_t0 };
+ 
+     bool do_transfer = !ctx->compute_ctx.expired();
+ 
+@@ -16615,7 +16866,10 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+             ctx->device->compute_queue->handle->submit({}, ctx->fence);
+         }
+         if (!ctx->device->serialize_submissions) {
++            const auto tw0 = std::chrono::steady_clock::now();
+             ggml_vk_wait_for_fence(ctx);
++            if (vk_timing.enabled) { vk_timing.wait_us += vk_timing_stats::us(tw0, std::chrono::steady_clock::now()); vk_timing.waits++;
++                if (vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: +%.0fus fence wait done (waited %.0fus)\n", vk_timing_stats::us(vk_timing.last_end, std::chrono::steady_clock::now()), vk_timing_stats::us(tw0, std::chrono::steady_clock::now())); } }
+         }
+         ctx->submit_pending = false;
+         if (cmd_buf) {
+@@ -17184,10 +17438,430 @@ static int32_t find_first_set(uint32_t x) {
+     return ret;
+ }
+ 
++// Find the LFM2 single-token fusion groups in a graph. The result is cached in
++// ctx->lfm2_plan and reused while the graph (nodes, shapes and allocation) is unchanged.
++static void ggml_vk_lfm2_analyze(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph) {
++    lfm2_fuse_plan & plan = ctx->lfm2_plan;
++    const uint32_t mask = ctx->device->lfm2_fusion_mask;
++    const int n_nodes = cgraph->n_nodes;
++
++    uint64_t fp = 1469598103934665603ULL;
++    auto mix = [&](uint64_t v) { fp = (fp ^ v) * 1099511628211ULL; };
++    mix((uint64_t)n_nodes);
++    mix(mask);
++    for (int i = 0; i < n_nodes; ++i) {
++        const ggml_tensor * n = cgraph->nodes[i];
++        mix((uint64_t)(uintptr_t)n);
++        mix((uint64_t)n->op);
++        mix((uint64_t)n->ne[0] ^ ((uint64_t)n->ne[1] << 24) ^ ((uint64_t)n->ne[2] << 44));
++        mix((uint64_t)(uintptr_t)n->data);
++        mix((uint64_t)(uintptr_t)n->src[0] ^ ((uint64_t)(uintptr_t)n->src[1] << 1));
++    }
++    if (plan.valid && plan.fingerprint == fp && (int)plan.role.size() == n_nodes) {
++        return;
++    }
++
++    plan.fingerprint = fp;
++    plan.valid = true;
++    plan.role.assign(n_nodes, LFM2_FUSE_NONE);
++    plan.group_of.assign(n_nodes, -1);
++    plan.groups.clear();
++
++    if (mask == 0 || n_nodes < 16) {
++        return;
++    }
++
++    std::unordered_map<const ggml_tensor *, int> index;
++    index.reserve(n_nodes * 2);
++    for (int i = 0; i < n_nodes; ++i) {
++        index[cgraph->nodes[i]] = i;
++    }
++    auto idx_of = [&](const ggml_tensor * t) -> int {
++        auto it = index.find(t);
++        return it == index.end() ? -1 : it->second;
++    };
++    auto uses = [&](const ggml_tensor * t) -> int {
++        const int i = idx_of(t);
++        return i < 0 ? -1 : ggml_node_get_use_count(cgraph, i);
++    };
++    auto is_leaf = [&](const ggml_tensor * t) { return t && t->op == GGML_OP_NONE && t->buffer != nullptr; };
++    auto is_vec = [&](const ggml_tensor * t, int64_t n) {
++        return t && t->type == GGML_TYPE_F32 && t->ne[0] == n && ggml_nelements(t) == n && ggml_is_contiguous(t) && t->buffer != nullptr;
++    };
++    auto is_kq = [&](ggml_type t) { return t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K; };
++    auto computes = [&](const ggml_tensor * t) {
++        return !(ggml_is_empty(t) || ggml_op_is_empty(t->op) || !t->buffer || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0);
++    };
++
++    std::vector<lfm2_fuse_group> cand;
++
++    for (int i = 0; i < n_nodes; ++i) {
++        const ggml_tensor * N = cgraph->nodes[i];
++        if (N->type != GGML_TYPE_F32 || !computes(N)) {
++            continue;
++        }
++
++        // ---- shortconv
++        if ((mask & (1u << LFM2_FUSE_CONV)) && N->op == GGML_OP_MUL && ggml_nelements(N) == N->ne[0]) {
++            const int64_t n = N->ne[0];
++            const ggml_tensor * S  = nullptr;
++            const ggml_tensor * CV = nullptr;
++            for (int k = 0; k < 2; ++k) {
++                if (N->src[k] && N->src[k]->op == GGML_OP_SSM_CONV) { S = N->src[k]; CV = N->src[1 - k]; }
++            }
++            do {
++                if (!S || !CV || CV->op != GGML_OP_VIEW) break;
++                const ggml_tensor * P = CV->view_src;
++                if (!P || P->op != GGML_OP_MUL_MAT || P->view_src || !is_vec(P, 3 * n) || !is_vec(CV, n) || CV->view_offs != (size_t)n * 4) break;
++                const ggml_tensor * C  = S->src[0];
++                const ggml_tensor * Kt = S->src[1];
++                if (!C || C->op != GGML_OP_CONCAT || C->view_src || C->ne[0] != 3 || C->ne[1] != n || ggml_nelements(C) != 3 * n) break;
++                if (!is_leaf(Kt) || Kt->type != GGML_TYPE_F32 || Kt->ne[0] != 3 || Kt->ne[1] != n || ggml_nelements(Kt) != 3 * n) break;
++                if (!is_vec(S, n) || ((const int32_t *)C->op_params)[0] != 0) break;
++                const ggml_tensor * R1 = C->src[0];
++                const ggml_tensor * T  = C->src[1];
++                if (!R1 || R1->op != GGML_OP_RESHAPE || R1->ne[0] != 2 || R1->ne[1] != n || ggml_nelements(R1) != 2 * n) break;
++                const ggml_tensor * G = R1->src[0];
++                if (!G || G->op != GGML_OP_GET_ROWS || !is_vec(G, 2 * n)) break;
++                const ggml_tensor * Gs  = G->src[0];
++                const ggml_tensor * ids = G->src[1];
++                if (!Gs || Gs->type != GGML_TYPE_F32 || Gs->ne[0] != 2 * n || !Gs->buffer || !ggml_is_contiguous(Gs)) break;
++                if (!ids || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || !ids->buffer) break;
++                if (!T || T->op != GGML_OP_TRANSPOSE) break;
++                const ggml_tensor * M1 = T->src[0];
++                if (!M1 || M1->op != GGML_OP_MUL || !is_vec(M1, n)) break;
++                const ggml_tensor * va = M1->src[0];
++                const ggml_tensor * vb = M1->src[1];
++                if (!va || !vb || va->op != GGML_OP_VIEW || vb->op != GGML_OP_VIEW || va->view_src != P || vb->view_src != P || !is_vec(va, n) || !is_vec(vb, n)) break;
++                if (!((va->view_offs == 0 && vb->view_offs == (size_t)n * 8) || (vb->view_offs == 0 && va->view_offs == (size_t)n * 8))) break;
++                const int ic = idx_of(C);
++                if (ic < 0) break;
++                int icpy = -1;
++                for (int j = ic + 1; j < i; ++j) {
++                    const ggml_tensor * c = cgraph->nodes[j];
++                    if (c->op == GGML_OP_CPY && c->src[0] && c->src[0]->op == GGML_OP_VIEW && c->src[0]->view_src == C &&
++                        c->src[0]->view_offs == 4 && c->src[0]->ne[0] == 2 && c->src[0]->ne[1] == n &&
++                        c->type == GGML_TYPE_F32 && ggml_nelements(c) == 2 * n && ggml_is_contiguous(c) && c->buffer && uses(c->src[0]) == 1) {
++                        icpy = j;
++                        break;
++                    }
++                }
++                if (icpy < 0) break;
++                if (uses(M1) != 1 || uses(T) != 1 || uses(C) != 2 || uses(S) != 1 || uses(G) != 1 || uses(R1) != 1) break;
++                const int im = idx_of(M1), is = idx_of(S), ig = idx_of(G);
++                if (im < 0 || is < 0 || ig < 0 || im > i || is > i || ig > i) break;
++
++                lfm2_fuse_group g;
++                g.kind = LFM2_FUSE_CONV;
++                g.anchor = i;
++                g.elided = { im, ic, icpy, is, ig };
++                g.in = { P, Gs, Kt, ids };
++                g.in_persistent = { false, false, true, false };
++                g.out = { N, cgraph->nodes[icpy] };
++                g.u[0] = (uint32_t)n;
++                g.u[1] = (uint32_t)(Gs->nb[1] / sizeof(float));
++                cand.push_back(std::move(g));
++            } while (false);
++        }
++
++        // ---- router front end: norm + router logits
++        if ((mask & (1u << LFM2_FUSE_ROUTER)) && N->op == GGML_OP_MUL_MAT && ggml_nelements(N) == N->ne[0]) {
++            do {
++                const ggml_tensor * W  = N->src[0];
++                const ggml_tensor * XN = N->src[1];
++                const int64_t n = W ? W->ne[0] : 0;
++                const int64_t n_expert = W ? W->ne[1] : 0;
++                if (!is_leaf(W) || W->type != GGML_TYPE_F32 || ggml_nelements(W) != n * n_expert || !ggml_is_contiguous(W)) break;
++                if (n % 4 != 0 || n_expert < 1 || n_expert > 1024 || N->ne[0] != n_expert || !ggml_is_contiguous(N)) break;
++                if (!XN || XN->op != GGML_OP_MUL || XN->view_src || !is_vec(XN, n)) break;
++                const ggml_tensor * RN = nullptr;
++                const ggml_tensor * gw = nullptr;
++                for (int k = 0; k < 2; ++k) {
++                    if (XN->src[k] && XN->src[k]->op == GGML_OP_RMS_NORM) { RN = XN->src[k]; gw = XN->src[1 - k]; }
++                }
++                if (!RN || !is_leaf(gw) || !is_vec(gw, n) || !is_vec(RN, n)) break;
++                const ggml_tensor * H = RN->src[0];
++                if (!is_vec(H, n)) break;
++                const int irn = idx_of(RN), ixn = idx_of(XN);
++                if (irn < 0 || ixn < 0 || irn > i || ixn > i || uses(RN) != 1) break;
++                // nothing else may read xn before the anchor writes it
++                bool early_reader = false;
++                for (int j = ixn + 1; j < i && !early_reader; ++j) {
++                    const ggml_tensor * c = cgraph->nodes[j];
++                    if (!computes(c)) continue;
++                    for (int k = 0; k < GGML_MAX_SRC; ++k) {
++                        if (c->src[k] && (c->src[k] == XN || c->src[k]->view_src == XN)) { early_reader = true; }
++                    }
++                }
++                if (early_reader) break;
++
++                lfm2_fuse_group g;
++                g.kind = LFM2_FUSE_ROUTER;
++                g.anchor = i;
++                g.elided = { irn, ixn };
++                g.in = { H, gw, W };
++                g.in_persistent = { false, true, true };
++                g.out = { XN, N };
++                g.u[0] = (uint32_t)n;
++                g.u[1] = (uint32_t)n_expert;
++                g.u[2] = (uint32_t)(4 * ((n / 4 + n_expert - 1) / n_expert));
++                g.f[0] = ggml_get_op_params_f32(RN, 0);
++                cand.push_back(std::move(g));
++            } while (false);
++        }
++
++        // ---- gate + up + swiglu
++        if ((mask & (1u << LFM2_FUSE_GATEUP)) && N->op == GGML_OP_GLU && N->src[1] != nullptr &&
++            ggml_get_glu_op(N) == GGML_GLU_OP_SWIGLU) {
++            do {
++                const ggml_tensor * A = N->src[0];
++                const ggml_tensor * B = N->src[1];
++                if (!A || !B || A->op != GGML_OP_MUL_MAT_ID || B->op != GGML_OP_MUL_MAT_ID || A->view_src || B->view_src) break;
++                if (A->src[1] != B->src[1] || A->src[2] != B->src[2]) break;
++                const ggml_tensor * Wg = A->src[0];
++                const ggml_tensor * Wu = B->src[0];
++                const ggml_tensor * X  = A->src[1];
++                const ggml_tensor * ids = A->src[2];
++                if (!is_leaf(Wg) || !is_leaf(Wu) || !is_kq(Wg->type) || !is_kq(Wu->type)) break;
++                const int64_t K = Wg->ne[0], M = Wg->ne[1];
++                if (Wu->ne[0] != K || Wu->ne[1] != M || Wu->ne[2] != Wg->ne[2] || K % 256 != 0 || Wg->ne[3] != 1) break;
++                if (!ggml_is_contiguous(Wg) || !ggml_is_contiguous(Wu)) break;
++                if (!is_vec(X, K) || !ids || ids->type != GGML_TYPE_I32 || !ids->buffer) break;
++                const int64_t n_used = ids->ne[0];
++                if (ggml_nelements(ids) != n_used || n_used < 1 || n_used > 8) break;
++                if (N->ne[0] != M || N->ne[1] != n_used || ggml_nelements(N) != M * n_used || !ggml_is_contiguous(N)) break;
++                if (A->ne[0] != M || A->ne[1] != n_used || B->ne[0] != M || B->ne[1] != n_used) break;
++                if (std::max(ggml_nbytes(Wg), ggml_nbytes(Wu)) > ctx->device->properties.limits.maxStorageBufferRange) break;
++                const int ia = idx_of(A), ib = idx_of(B);
++                if (ia < 0 || ib < 0 || ia > i || ib > i || uses(A) != 1 || uses(B) != 1) break;
++
++                lfm2_fuse_group g;
++                g.kind = LFM2_FUSE_GATEUP;
++                g.anchor = i;
++                g.elided = { ia, ib };
++                g.in = { Wg, Wu, X, ids };
++                g.in_persistent = { true, true, false, false };
++                g.out = { N };
++                g.u[0] = (uint32_t)K;
++                g.u[1] = (uint32_t)M;
++                g.u[2] = (uint32_t)n_used;
++                g.u[4] = Wg->type == GGML_TYPE_Q5_K;
++                g.u[5] = Wu->type == GGML_TYPE_Q5_K;
++                cand.push_back(std::move(g));
++            } while (false);
++        }
++
++        if (N->op == GGML_OP_ADD && ggml_nelements(N) == N->ne[0]) {
++            const int64_t n = N->ne[0];
++            bool matched = false;
++
++            // ---- down + expert weights + sum + residual
++            if (mask & (1u << LFM2_FUSE_DOWN)) {
++                for (int k = 0; k < 2 && !matched; ++k) {
++                    const ggml_tensor * RS = N->src[k];
++                    const ggml_tensor * RESID = N->src[1 - k];
++                    if (!RS || !RESID || RS->op != GGML_OP_RESHAPE || !is_vec(RESID, n)) continue;
++                    const ggml_tensor * SR = RS->src[0];
++                    if (!SR || SR->op != GGML_OP_SUM_ROWS || SR->ne[0] != 1 || SR->ne[1] != n) continue;
++                    const ggml_tensor * CT = SR->src[0];
++                    if (!CT || CT->op != GGML_OP_CONT) continue;
++                    const ggml_tensor * PM = CT->src[0];
++                    if (!PM || PM->op != GGML_OP_PERMUTE) continue;
++                    const ggml_tensor * MW = PM->src[0];
++                    if (!MW || MW->op != GGML_OP_MUL || MW->view_src) continue;
++                    const ggml_tensor * DN = MW->src[0];
++                    const ggml_tensor * WR = MW->src[1];
++                    if (!DN || DN->op != GGML_OP_MUL_MAT_ID || DN->view_src || !WR) continue;
++                    const ggml_tensor * Wd  = DN->src[0];
++                    const ggml_tensor * Hh  = DN->src[1];
++                    const ggml_tensor * ids = DN->src[2];
++                    if (!is_leaf(Wd) || !is_kq(Wd->type) || !ggml_is_contiguous(Wd) || Wd->ne[3] != 1) continue;
++                    const int64_t K = Wd->ne[0];
++                    if (Wd->ne[1] != n || K % 256 != 0) continue;
++                    if (!ids || ids->type != GGML_TYPE_I32 || !ids->buffer) continue;
++                    const int64_t n_used = ids->ne[0];
++                    if (ggml_nelements(ids) != n_used || n_used < 1 || n_used > 8) continue;
++                    if (!Hh || Hh->type != GGML_TYPE_F32 || Hh->ne[0] != K || Hh->ne[1] != n_used || ggml_nelements(Hh) != K * n_used || !ggml_is_contiguous(Hh) || !Hh->buffer) continue;
++                    if (DN->ne[0] != n || DN->ne[1] != n_used || ggml_nelements(MW) != n * n_used) continue;
++                    if (WR->type != GGML_TYPE_F32 || ggml_nelements(WR) != n_used || WR->ne[1] != n_used || !WR->buffer || !ggml_is_contiguous(WR)) continue;
++                    if (PM->ne[0] != n_used || PM->ne[1] != n || ggml_nelements(CT) != n * n_used) continue;
++                    if (ggml_nbytes(Wd) > ctx->device->properties.limits.maxStorageBufferRange) continue;
++                    const int idn = idx_of(DN), imw = idx_of(MW), ict = idx_of(CT), isr = idx_of(SR);
++                    if (idn < 0 || imw < 0 || ict < 0 || isr < 0 || idn > i || imw > i || ict > i || isr > i) continue;
++                    if (uses(RS) != 1 || uses(SR) != 1 || uses(CT) != 1 || uses(PM) != 1 || uses(MW) != 1 || uses(DN) != 1) continue;
++
++                    lfm2_fuse_group g;
++                    g.kind = LFM2_FUSE_DOWN;
++                    g.anchor = i;
++                    g.elided = { idn, imw, ict, isr };
++                    g.in = { Wd, Hh, ids, WR, RESID };
++                    g.in_persistent = { true, false, false, false, false };
++                    g.inplace_ok = 4;
++                    g.out = { N };
++                    g.u[0] = (uint32_t)K;
++                    g.u[1] = (uint32_t)n;
++                    g.u[2] = (uint32_t)n_used;
++                    g.u[4] = Wd->type == GGML_TYPE_Q5_K;
++                    cand.push_back(std::move(g));
++                    matched = true;
++                }
++            }
++
++            // ---- mat-vec + residual add through a reshape
++            if (!matched && (mask & (1u << LFM2_FUSE_MMV_ADD))) {
++                for (int k = 0; k < 2 && !matched; ++k) {
++                    const ggml_tensor * RS = N->src[k];
++                    const ggml_tensor * BIAS = N->src[1 - k];
++                    if (!RS || !BIAS || RS->op != GGML_OP_RESHAPE || !is_vec(BIAS, n)) continue;
++                    const ggml_tensor * MM = RS->src[0];
++                    if (!MM || MM->op != GGML_OP_MUL_MAT || MM->view_src || !is_vec(MM, n)) continue;
++                    const ggml_tensor * Wm = MM->src[0];
++                    const ggml_tensor * X  = MM->src[1];
++                    if (!is_leaf(Wm) || !ggml_is_contiguous(Wm) || Wm->ne[1] != n || Wm->ne[2] != 1 || Wm->ne[3] != 1) continue;
++                    if (!(ggml_is_quantized(Wm->type) || Wm->type == GGML_TYPE_F32 || Wm->type == GGML_TYPE_F16)) continue;
++                    if (!is_vec(X, Wm->ne[0])) continue;
++                    if (ggml_nbytes(Wm) > ctx->device->properties.limits.maxStorageBufferRange) continue;
++                    if (ggml_vk_can_use_fwht(ctx, X, MM)) continue;
++                    const int imm = idx_of(MM);
++                    if (imm < 0 || imm > i || uses(MM) != 1 || uses(RS) != 1) continue;
++
++                    lfm2_fuse_group g;
++                    g.kind = LFM2_FUSE_MMV_ADD;
++                    g.anchor = i;
++                    g.mm_idx = imm;
++                    g.elided = { imm };
++                    g.in = { Wm, X, BIAS };
++                    g.in_persistent = { true, false, false };
++                    g.inplace_ok = 2;
++                    g.out = { N };
++                    cand.push_back(std::move(g));
++                    matched = true;
++                }
++            }
++        }
++    }
++
++    // Tentatively accept every candidate whose nodes aren't already claimed.
++    std::vector<bool> accepted(cand.size(), false);
++    for (size_t c = 0; c < cand.size(); ++c) {
++        lfm2_fuse_group & g = cand[c];
++        bool free_nodes = plan.role[g.anchor] == LFM2_FUSE_NONE;
++        for (int e : g.elided) {
++            free_nodes = free_nodes && plan.role[e] == LFM2_FUSE_NONE;
++        }
++        if (!free_nodes) {
++            continue;
++        }
++        g.first = g.anchor;
++        for (int e : g.elided) {
++            plan.role[e] = LFM2_FUSE_ELIDE;
++            g.first = std::min(g.first, e);
++        }
++        plan.role[g.anchor] = g.kind;
++        accepted[c] = true;
++    }
++
++    // A fused kernel reads its inputs at the anchor, later than the nodes it replaces
++    // would have. Reject a group if the allocator reused an input's memory for some
++    // node that still runs in between, or if an output overlaps an input.
++    auto group_ok = [&](const lfm2_fuse_group & g) -> bool {
++        for (size_t o = 0; o < g.out.size(); ++o) {
++            for (size_t x = 0; x < g.in.size(); ++x) {
++                const bool elementwise = o == 0 && (int)x == g.inplace_ok;
++                if (ggml_vk_tensors_overlap(g.in[x], g.out[o], elementwise)) {
++                    // the conv state is read and rewritten per channel by one thread
++                    if (g.kind == LFM2_FUSE_CONV && o == 1 && x == 1) continue;
++                    return false;
++                }
++            }
++        }
++        for (size_t x = 0; x < g.in.size(); ++x) {
++            if (g.in_persistent[x]) {
++                continue;
++            }
++            const ggml_tensor * t = g.in[x];
++            const ggml_tensor * root = t->view_src ? t->view_src : t;
++            const int produced = std::max(idx_of(t), idx_of(root));
++            for (int j = std::max(produced, -1) + 1; j < g.anchor; ++j) {
++                const ggml_tensor * c = cgraph->nodes[j];
++                if (plan.role[j] == LFM2_FUSE_ELIDE || !computes(c)) {
++                    continue;
++                }
++                if (ggml_vk_tensors_overlap(c, t, false)) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    };
++
++    bool changed = true;
++    while (changed) {
++        changed = false;
++        for (size_t c = 0; c < cand.size(); ++c) {
++            if (!accepted[c] || group_ok(cand[c])) {
++                continue;
++            }
++            for (int e : cand[c].elided) {
++                plan.role[e] = LFM2_FUSE_NONE;
++            }
++            plan.role[cand[c].anchor] = LFM2_FUSE_NONE;
++            accepted[c] = false;
++            changed = true;
++        }
++    }
++
++    uint32_t n_kind[8] {};
++    uint32_t n_rejected = 0;
++    for (size_t c = 0; c < cand.size(); ++c) {
++        if (!accepted[c]) {
++            n_rejected++;
++            continue;
++        }
++        plan.group_of[cand[c].anchor] = (int)plan.groups.size();
++        n_kind[cand[c].kind]++;
++        plan.groups.push_back(std::move(cand[c]));
++    }
++    if (getenv("GGML_VK_LFM2_DEBUG")) {
++        fprintf(stderr, "ggml_vulkan: lfm2 fusion: %d nodes, conv=%u router=%u gateup=%u down=%u mmv_add=%u rejected=%u\n",
++                n_nodes, n_kind[LFM2_FUSE_CONV], n_kind[LFM2_FUSE_ROUTER], n_kind[LFM2_FUSE_GATEUP], n_kind[LFM2_FUSE_DOWN], n_kind[LFM2_FUSE_MMV_ADD], n_rejected);
++    }
++}
++
+ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+ 
++    const auto timing_start = std::chrono::steady_clock::now();
++    if (vk_timing.enabled && vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: +%.0fus graph_compute start (%d nodes)\n", vk_timing_stats::us(vk_timing.last_end, timing_start), cgraph->n_nodes); }
++    if (vk_timing.enabled) {
++        if (vk_timing.graphs % 128 == 100 && !vk_timing.submit_at.empty()) {
++            fprintf(stderr, "vk-timing: submits of previous graph (us from start @ first node idx):");
++            for (auto & sa : vk_timing.submit_at) fprintf(stderr, " %.0f@%d", sa.first, sa.second);
++            fprintf(stderr, "\n");
++        }
++        vk_timing.submit_at.clear();
++        vk_timing.graph_start = timing_start;
++    }
++    struct timing_scope {
++        std::chrono::steady_clock::time_point t0;
++        ~timing_scope() {
++            if (!vk_timing.enabled) return;
++            const auto now = std::chrono::steady_clock::now();
++            if (vk_timing.graphs > 0) vk_timing.between_us += vk_timing_stats::us(vk_timing.last_end, t0);
++            if (vk_timing.graphs % 128 == 100) { fprintf(stderr, "vk-timing: graph_compute end after %.0fus\n", vk_timing_stats::us(t0, now)); }
++            vk_timing.record_us += vk_timing_stats::us(t0, now);
++            vk_timing.last_end = now;
++            if (++vk_timing.graphs % 128 == 0) {
++                const double g = 128.0;
++                fprintf(stderr, "vk-timing: per graph: record %.0f us | between graphs %.0f us (of which synchronize %.0f us in %.1f calls, fence wait %.0f us) | total %.0f us\n",
++                        vk_timing.record_us / g, vk_timing.between_us / g, vk_timing.sync_us / g, vk_timing.syncs / g, vk_timing.wait_us / g,
++                        (vk_timing.record_us + vk_timing.between_us) / g);
++                vk_timing.record_us = vk_timing.between_us = vk_timing.sync_us = vk_timing.wait_us = 0; vk_timing.syncs = vk_timing.waits = 0;
++            }
++        }
++    } timing_scope_guard { timing_start };
++
+     ctx->device->diag_cgraph = nullptr;
+     ctx->device->diag_prev_start = -1;
+     ctx->device->diag_prev_end = -1;
+@@ -17205,6 +17879,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->do_add_rms_partials = false;
+     ctx->do_add_rms_partials_offset_calculation = false;
+ 
++    if (getenv("GGML_VK_DUMP_GRAPH")) {
++        static int dump_count = 0;
++        if (dump_count++ == atoi(getenv("GGML_VK_DUMP_GRAPH"))) {
++            std::unordered_map<const ggml_tensor *, int> idx;
++            for (int i = 0; i < cgraph->n_nodes; i++) { idx[cgraph->nodes[i]] = i; }
++            for (int i = 0; i < cgraph->n_nodes; i++) {
++                const ggml_tensor * n = cgraph->nodes[i];
++                fprintf(stderr, "DUMP %4d %-12s %-5s [%5d,%5d,%4d,%3d] uses=%d %s%s <-", i, ggml_op_name(n->op), ggml_type_name(n->type),
++                        (int)n->ne[0], (int)n->ne[1], (int)n->ne[2], (int)n->ne[3], ggml_node_get_use_count(cgraph, i),
++                        (n->flags & GGML_TENSOR_FLAG_OUTPUT) ? "OUT " : "", n->name);
++                for (int s = 0; s < GGML_MAX_SRC; s++) {
++                    const ggml_tensor * t = n->src[s];
++                    if (!t) continue;
++                    auto it = idx.find(t);
++                    if (it != idx.end()) fprintf(stderr, " #%d", it->second);
++                    else fprintf(stderr, " {%s %s [%d,%d,%d,%d]}", t->name, ggml_type_name(t->type), (int)t->ne[0], (int)t->ne[1], (int)t->ne[2], (int)t->ne[3]);
++                }
++                if (n->view_src) fprintf(stderr, "  view_offs=%zu", n->view_offs);
++                fprintf(stderr, "\n");
++            }
++        }
++    }
++
+     int last_node = cgraph->n_nodes - 1;
+ 
+     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
+@@ -17218,6 +17915,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     bool first_node_in_batch = true; // true if next node will be first node in a batch
+     int submit_node_idx = 0; // index to first node in a batch
+ 
++    const auto timing_pre_analyze = std::chrono::steady_clock::now();
++    ggml_vk_lfm2_analyze(ctx, cgraph);
++    const lfm2_fuse_plan & lfm2_plan = ctx->lfm2_plan;
++    if (vk_timing.enabled && vk_timing.graphs % 128 == 100) {
++        fprintf(stderr, "vk-timing: graph prologue %.0fus, lfm2 analyze %.0fus\n", vk_timing_stats::us(timing_start, timing_pre_analyze), vk_timing_stats::us(timing_pre_analyze, std::chrono::steady_clock::now()));
++    }
++
+     ggml_vk_submit_transfer_ctx(ctx);
+ 
+     vk_context compute_ctx;
+@@ -17281,7 +17985,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
+         }
+     }
+-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
++    static const uint32_t submit_div = getenv("GGML_VK_SUBMIT_DIV") ? (uint32_t)std::max(1, atoi(getenv("GGML_VK_SUBMIT_DIV"))) : 40u;
++    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / submit_div);
++    if (getenv("GGML_VK_SUBMIT_DEBUG")) {
++        static int dbg = 0;
++        if (dbg++ % 64 == 40) fprintf(stderr, "submit-debug: last graph submits=%u total_flops=%llu\n", ctx->lfm2_last_submit_count, (unsigned long long)ctx->last_total_flops);
++    }
+ 
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
+@@ -17336,6 +18045,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             batch_flops += node_flops;
+         }
+ 
++        const uint8_t lfm2_role = lfm2_plan.role[i];
++        if (lfm2_role == LFM2_FUSE_ELIDE) {
++            // computed by the fused kernel emitted at this group's anchor
++            continue;
++        }
++        ctx->lfm2_cur = lfm2_role != LFM2_FUSE_NONE ? &lfm2_plan.groups[lfm2_plan.group_of[i]] : nullptr;
++
+         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
+         // the fused result in an elementwise-way. This affects whether the memory for
+         // the src is allowed to overlap the memory for the destination.
+@@ -17345,7 +18061,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
+         const char *fusion_string {};
+-        if (!ctx->device->disable_fusion) {
++        if (ctx->lfm2_cur) {
++            static const char * const lfm2_names[] = { "", "", "LFM2_CONV", "LFM2_ROUTER", "LFM2_GATEUP", "LFM2_DOWN", "LFM2_MMV_ADD" };
++            fusion_string = lfm2_names[lfm2_role];
++        } else if (!ctx->device->disable_fusion) {
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+             if (num_adds) {
+                 ctx->num_additional_fused_ops = num_adds - 1;
+@@ -17554,12 +18273,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
+         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
++        // Get the GPU started as early as possible: while it is idle at the top of a decode
++        // step, every microsecond of command recording before the first submit is lost.
++        static const uint32_t first_submit_nodes = getenv("GGML_VK_FIRST_SUBMIT_NODES") ? (uint32_t)atoi(getenv("GGML_VK_FIRST_SUBMIT_NODES")) : 3u;
+         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
++                      (first_submit_nodes != 0 && submit_count < 2 && submitted_nodes >= first_submit_nodes * (submit_count + 1)) ||
+                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+                       (i + ctx->num_additional_fused_ops >= last_node) ||
+                       (almost_ready && !ctx->almost_ready_fence_pending);
+ 
++        const auto timing_node0 = std::chrono::steady_clock::now();
+         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
++        if (vk_timing.enabled && vk_timing.graphs % 128 == 100 && i < 40 && enqueued) {
++            fprintf(stderr, "vk-timing: node %d %s at +%.0fus took %.0fus%s\n", i, ggml_op_name(cgraph->nodes[i]->op), vk_timing_stats::us(timing_start, timing_node0), vk_timing_stats::us(timing_node0, std::chrono::steady_clock::now()), submit ? " (submit)" : "");
++        }
+ 
+         if (vk_perf_logger_enabled && enqueued) {
+             compute_ctx = ggml_vk_get_compute_ctx(ctx);
+@@ -17592,9 +18319,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         i += ctx->num_additional_fused_ops;
+         ctx->num_additional_fused_ops = 0;
+         ctx->fused_ops_write_mask = 0;
++        ctx->lfm2_cur = nullptr;
+     }
+ 
+     ctx->last_total_flops = total_flops;
++    ctx->lfm2_last_submit_count = submit_count;
+ 
+     if (vk_perf_logger_enabled) {
+         // End the command buffer and submit/wait
+@@ -17616,6 +18345,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 auto node = ctx->query_nodes[i];
+                 auto name = ctx->query_fusion_names[i];
+                 ctx->perf_logger->log_timing(node, name, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
++                if (getenv("GGML_VK_PERF_TRACE")) {
++                    uint64_t fl;
++                    fprintf(stderr, "TRACE %7.2f us  %-60s %s\n", (timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod / 1000.0,
++                            ctx->perf_logger->get_node_fusion_name(node, name, &fl).c_str(), node->name);
++                }
++            }
++            if (getenv("GGML_VK_PERF_TRACE")) {
++                fprintf(stderr, "TRACE ---- end graph\n");
+             }
+         } else {
+             // Log each group of nodes
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_conv.comp b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_conv.comp
+new file mode 100644
+index 0000000..35f5708
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_conv.comp
+@@ -0,0 +1,47 @@
++#version 450
++
++// Fused LFM2 short-convolution block for single-token decode (per channel c):
++//   bx        = b[c] * x[c]                                  (b, c, x are the three chunks of in_proj)
++//   y[c]      = cgate[c] * (s0*k[0] + s1*k[1] + bx*k[2])     (s0, s1: recurrent conv state)
++//   state'[c] = (s1, bx)
++// Replaces MUL + GET_ROWS + CONCAT + CPY + SSM_CONV + MUL.
++
++layout (push_constant) uniform parameter
++{
++    uint n;          // channels
++    uint rs_stride;  // elements per recurrent-state row
++} p;
++
++layout (binding = 0) readonly buffer BCX  {float data_bcx[];};
++layout (binding = 1) readonly buffer SIN  {float data_sin[];};
++layout (binding = 2) readonly buffer KERN {float data_k[];};
++layout (binding = 3) readonly buffer IDS  {int data_ids[];};
++layout (binding = 4) writeonly buffer Y    {float data_y[];};
++layout (binding = 5) writeonly buffer SOUT {float data_sout[];};
++
++layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++void main() {
++    const uint c = gl_GlobalInvocationID.x;
++    if (c >= p.n) {
++        return;
++    }
++
++    const uint srow = uint(data_ids[0]) * p.rs_stride;
++
++    const float b  = data_bcx[c];
++    const float cg = data_bcx[p.n + c];
++    const float x  = data_bcx[2 * p.n + c];
++    const float bx = b * x;
++
++    const float s0 = data_sin[srow + 2 * c];
++    const float s1 = data_sin[srow + 2 * c + 1];
++
++    float sum = s0 * data_k[3 * c];
++    sum += s1 * data_k[3 * c + 1];
++    sum += bx * data_k[3 * c + 2];
++
++    data_y[c] = cg * sum;
++    data_sout[2 * c]     = s1;
++    data_sout[2 * c + 1] = bx;
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_kq_dot.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_kq_dot.glsl
+new file mode 100644
+index 0000000..eb9e646
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_kq_dot.glsl
+@@ -0,0 +1,102 @@
++// K-quant (Q4_K / Q5_K) partial dot product for one 256-weight block, written as a
++// template so one shader can instantiate it against several weight buffers.
++//
++// The includer defines, before each #include:
++//   KQ_NAME   - name of the generated function
++//   KQ_A      - block array (gives .dm)
++//   KQ_A16    - the same buffer viewed as the packed16 struct
++//   KQ_A32    - the same buffer viewed as the packed32 struct (Q4_K only)
++//   KQ_Q5     - define for Q5_K, leave undefined for Q4_K
++// and, once per shader, the activation accessors LFM2_X4(i) / LFM2_X2(i), which
++// return the vec4 / vec2 starting at float index i (i divisible by 4 / 2).
++//
++// 16 threads cooperate on one block; itid (0..15) selects the 16 weights this
++// thread owns. The mapping is the same as mul_mat_vec_q4_k.comp / mul_mat_vec_q5_k.comp.
++
++float KQ_NAME(const uint ib, const uint xbase, const uint itid) {
++    const uint il = itid / 4;       // 0...3
++    const uint ir = itid - 4 * il;  // 0...3
++    const uint v_im = il / 2;       // 0 computes 0,32 + 128,160; 1 computes 64,96 + 192,224
++    const uint v_in = il % 2;
++
++#ifdef KQ_Q5
++    const uint l0 = 4 * ir + 2 * v_in;    // 0...15
++#else
++    const uint l0 = 4 * (2 * ir + v_in);  // 0...28
++#endif
++    const uint q_offset = 32 * v_im + l0;
++    const uint y1_idx = xbase + 64 * v_im + l0;
++    const uint y2_idx = y1_idx + 128;
++
++    const vec2 dm = vec2(KQ_A[ib].dm);
++
++    const uint32_t scale0_u32 = KQ_A16[ib].scales[v_im    ];
++    const uint32_t scale4_u32 = KQ_A16[ib].scales[v_im + 2];
++    const uint32_t scale8_u32 = KQ_A16[ib].scales[v_im + 4];
++
++    const uint32_t scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
++    const uint32_t scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0) >> 2;
++    const vec4 scale_0_4_l_f = vec4(unpack8(scale_0_4_l & 0x3F3F3F3F));
++    const vec4 scale8_f = vec4(unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0F) | scale_0_4_h));
++
++    const float sc0 = scale_0_4_l_f.x;
++    const float sc1 = scale_0_4_l_f.y;
++    const float sc2 = scale_0_4_l_f.z;
++    const float sc3 = scale_0_4_l_f.w;
++    const float sc4 = scale8_f.x;
++    const float sc5 = scale8_f.y;
++    const float sc6 = scale8_f.z;
++    const float sc7 = scale8_f.w;
++
++#ifdef KQ_Q5
++    const uint32_t qs0_u32  = uint32_t(KQ_A16[ib].qs[q_offset / 2])      | (uint32_t(KQ_A16[ib].qs[q_offset / 2 +  8]) << 16);
++    const uint32_t qs64_u32 = uint32_t(KQ_A16[ib].qs[q_offset / 2 + 32]) | (uint32_t(KQ_A16[ib].qs[q_offset / 2 + 40]) << 16);
++
++    const uint32_t qh = pack32(u16vec2(KQ_A16[ib].qh[l0 / 2], KQ_A16[ib].qh[l0 / 2 + 8]));
++
++    const uint32_t qs0_lo4  = (qs0_u32 & 0x0F0F0F0F)         + (((qh >> (2 * v_im)) & 0x01010101) << 4);
++    const uint32_t qs0_hi4  = ((qs0_u32 >> 4) & 0x0F0F0F0F)  + (((qh >> (2 * v_im)) & 0x02020202) << 3);
++    const uint32_t qs64_lo4 = (qs64_u32 & 0x0F0F0F0F)        +  ((qh >> (2 * v_im)) & 0x10101010);
++    const uint32_t qs64_hi4 = ((qs64_u32 >> 4) & 0x0F0F0F0F) + (((qh >> (2 * v_im)) & 0x20202020) >> 1);
++
++    const vec2 a0 = LFM2_X2(y1_idx);
++    const vec2 a1 = LFM2_X2(y1_idx + 16);
++    const vec2 a2 = LFM2_X2(y1_idx + 32);
++    const vec2 a3 = LFM2_X2(y1_idx + 48);
++    const vec2 b0 = LFM2_X2(y2_idx);
++    const vec2 b1 = LFM2_X2(y2_idx + 16);
++    const vec2 b2 = LFM2_X2(y2_idx + 32);
++    const vec2 b3 = LFM2_X2(y2_idx + 48);
++
++    const vec4 by10  = vec4(a0, a1);
++    const vec4 by132 = vec4(a2, a3);
++    const vec4 by20  = vec4(b0, b1);
++    const vec4 by232 = vec4(b2, b3);
++#else
++    const uint32_t qs0_u32  = KQ_A32[ib].qs[q_offset / 4];
++    const uint32_t qs64_u32 = KQ_A32[ib].qs[q_offset / 4 + 16];
++
++    const uint32_t qs0_lo4  = qs0_u32 & 0x0F0F0F0F;
++    const uint32_t qs0_hi4  = (qs0_u32 >> 4) & 0x0F0F0F0F;
++    const uint32_t qs64_lo4 = qs64_u32 & 0x0F0F0F0F;
++    const uint32_t qs64_hi4 = (qs64_u32 >> 4) & 0x0F0F0F0F;
++
++    const vec4 by10  = LFM2_X4(y1_idx);
++    const vec4 by132 = LFM2_X4(y1_idx + 32);
++    const vec4 by20  = LFM2_X4(y2_idx);
++    const vec4 by232 = LFM2_X4(y2_idx + 32);
++#endif
++
++    const float sx = dot(by10,  vec4(unpack8(qs0_lo4)));
++    const float sy = dot(by132, vec4(unpack8(qs0_hi4)));
++    const float sz = dot(by20,  vec4(unpack8(qs64_lo4)));
++    const float sw = dot(by232, vec4(unpack8(qs64_hi4)));
++
++    const float smin =
++        fma(by10.x + by10.y + by10.z + by10.w,     sc2,
++        fma(by132.x + by132.y + by132.z + by132.w, sc3,
++        fma(by20.x + by20.y + by20.z + by20.w,     sc6,
++           (by232.x + by232.y + by232.z + by232.w) * sc7)));
++
++    return fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), -dm.y * smin);
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_moe_down.comp b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_moe_down.comp
+new file mode 100644
+index 0000000..28311ee
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_moe_down.comp
+@@ -0,0 +1,101 @@
++#version 450
++
++// Fused MoE down projection for single-token decode:
++//   d[r] = resid[r] + sum_e w[e] * dot(down[ids[e]][r], h[e])
++// Replaces MUL_MAT_ID + MUL (expert weights) + CONT + SUM_ROWS + ADD (residual).
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++
++#include "types.glsl"
++
++layout (push_constant) uniform parameter
++{
++    uint ncols;            // K, a multiple of 256
++    uint nrows;
++    uint blocks_per_expert;
++    uint n_used;
++    uint x_stride;         // input elements per expert slot
++} p;
++
++#ifdef DOWN_Q5
++#define DOWN_T   block_q5_K
++#define DOWN_T16 block_q5_K_packed16
++#define DOWN_T32 block_q5_K_packed32
++#else
++#define DOWN_T   block_q4_K
++#define DOWN_T16 block_q4_K_packed16
++#define DOWN_T32 block_q4_K_packed32
++#endif
++
++layout (binding = 0) readonly buffer A   {DOWN_T   data_a[];};
++layout (binding = 0) readonly buffer A16 {DOWN_T16 data_a16[];};
++layout (binding = 0) readonly buffer A32 {DOWN_T32 data_a32[];};
++layout (binding = 1) readonly buffer X   {float data_x[];};
++layout (binding = 1) readonly buffer XV2 {vec2 data_x_v2[];};
++layout (binding = 1) readonly buffer XV4 {vec4 data_x_v4[];};
++layout (binding = 2) readonly buffer IDS {int data_ids[];};
++layout (binding = 3) readonly buffer W   {float data_w[];};
++layout (binding = 4) readonly buffer R   {float data_r[];};
++layout (binding = 5) writeonly buffer D  {float data_d[];};
++
++#define LFM2_X4(i) data_x_v4[(i) / 4]
++#define LFM2_X2(i) data_x_v2[(i) / 2]
++
++#define KQ_NAME dot_down
++#define KQ_A    data_a
++#define KQ_A16  data_a16
++#define KQ_A32  data_a32
++#ifdef DOWN_Q5
++#define KQ_Q5
++#endif
++#include "lfm2_kq_dot.glsl"
++
++layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++layout (constant_id = 0) const uint BLOCK_SIZE = 32;
++layout (constant_id = 1) const uint NUM_ROWS = 2;
++
++void main() {
++    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
++    const uint nb = p.ncols / 256;
++
++    const uint tid = gl_LocalInvocationID.x;
++    const uint itid = tid % 16;
++    const uint ix = tid / 16;
++    const uint it_size = gl_WorkGroupSize.x / 16;
++
++    float acc[NUM_ROWS];
++    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++        acc[n] = 0.0;
++    }
++
++    for (uint e = 0; e < p.n_used; ++e) {
++        const uint expert = uint(data_ids[e]);
++        const float w = data_w[e];
++        const uint xbase = e * p.x_stride;
++        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++            const uint row = min(first_row + n, p.nrows - 1);
++            const uint ib0 = expert * p.blocks_per_expert + row * nb;
++            float t = 0.0;
++            for (uint i = ix; i < nb; i += it_size) {
++                t += dot_down(ib0 + i, xbase + i * 256, itid);
++            }
++            acc[n] = fma(w, t, acc[n]);
++        }
++    }
++
++    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++        acc[n] = subgroupAdd(acc[n]);
++    }
++
++    if (tid == 0) {
++        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++            const uint row = first_row + n;
++            if (row < p.nrows) {
++                data_d[row] = data_r[row] + acc[n];
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_moe_gateup.comp b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_moe_gateup.comp
+new file mode 100644
+index 0000000..e3acf1a
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_moe_gateup.comp
+@@ -0,0 +1,128 @@
++#version 450
++
++// Fused MoE gate + up projection + SwiGLU for single-token decode:
++//   d[e][r] = silu(dot(gate[ids[e]][r], x)) * dot(up[ids[e]][r], x)
++// Replaces two MUL_MAT_ID dispatches and the GLU dispatch that joins them.
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++
++#include "types.glsl"
++
++layout (push_constant) uniform parameter
++{
++    uint ncols;            // K, a multiple of 256
++    uint nrows;            // rows per expert
++    uint blocks_per_expert;
++    uint n_used;
++    uint d_stride;         // output elements per expert slot
++} p;
++
++#ifdef GATE_Q5
++#define GATE_T   block_q5_K
++#define GATE_T16 block_q5_K_packed16
++#define GATE_T32 block_q5_K_packed32
++#else
++#define GATE_T   block_q4_K
++#define GATE_T16 block_q4_K_packed16
++#define GATE_T32 block_q4_K_packed32
++#endif
++
++#ifdef UP_Q5
++#define UP_T   block_q5_K
++#define UP_T16 block_q5_K_packed16
++#define UP_T32 block_q5_K_packed32
++#else
++#define UP_T   block_q4_K
++#define UP_T16 block_q4_K_packed16
++#define UP_T32 block_q4_K_packed32
++#endif
++
++layout (binding = 0) readonly buffer G   {GATE_T   data_g[];};
++layout (binding = 0) readonly buffer G16 {GATE_T16 data_g16[];};
++layout (binding = 0) readonly buffer G32 {GATE_T32 data_g32[];};
++layout (binding = 1) readonly buffer U   {UP_T   data_u[];};
++layout (binding = 1) readonly buffer U16 {UP_T16 data_u16[];};
++layout (binding = 1) readonly buffer U32 {UP_T32 data_u32[];};
++layout (binding = 2) readonly buffer X   {float data_x[];};
++layout (binding = 2) readonly buffer XV2 {vec2 data_x_v2[];};
++layout (binding = 2) readonly buffer XV4 {vec4 data_x_v4[];};
++layout (binding = 3) readonly buffer IDS {int data_ids[];};
++layout (binding = 4) writeonly buffer D  {float data_d[];};
++
++#define LFM2_X4(i) data_x_v4[(i) / 4]
++#define LFM2_X2(i) data_x_v2[(i) / 2]
++
++#define KQ_NAME dot_gate
++#define KQ_A    data_g
++#define KQ_A16  data_g16
++#define KQ_A32  data_g32
++#ifdef GATE_Q5
++#define KQ_Q5
++#endif
++#include "lfm2_kq_dot.glsl"
++#undef KQ_NAME
++#undef KQ_A
++#undef KQ_A16
++#undef KQ_A32
++#undef KQ_Q5
++
++#define KQ_NAME dot_up
++#define KQ_A    data_u
++#define KQ_A16  data_u16
++#define KQ_A32  data_u32
++#ifdef UP_Q5
++#define KQ_Q5
++#endif
++#include "lfm2_kq_dot.glsl"
++#undef KQ_NAME
++#undef KQ_A
++#undef KQ_A16
++#undef KQ_A32
++#undef KQ_Q5
++
++layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++layout (constant_id = 0) const uint BLOCK_SIZE = 32;
++layout (constant_id = 1) const uint NUM_ROWS = 2;
++
++void main() {
++    const uint slot = gl_WorkGroupID.y;
++    const uint expert = uint(data_ids[slot]);
++    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
++    const uint nb = p.ncols / 256;
++
++    const uint tid = gl_LocalInvocationID.x;
++    const uint itid = tid % 16;
++    const uint ix = tid / 16;
++    const uint it_size = gl_WorkGroupSize.x / 16;
++
++    float tg[NUM_ROWS];
++    float tu[NUM_ROWS];
++
++    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++        tg[n] = 0.0;
++        tu[n] = 0.0;
++        const uint row = min(first_row + n, p.nrows - 1);
++        const uint ib0 = expert * p.blocks_per_expert + row * nb;
++        for (uint i = ix; i < nb; i += it_size) {
++            tg[n] += dot_gate(ib0 + i, i * 256, itid);
++            tu[n] += dot_up(ib0 + i, i * 256, itid);
++        }
++    }
++
++    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++        tg[n] = subgroupAdd(tg[n]);
++        tu[n] = subgroupAdd(tu[n]);
++    }
++
++    if (tid == 0) {
++        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++            const uint row = first_row + n;
++            if (row < p.nrows) {
++                data_d[slot * p.d_stride + row] = tg[n] / (1.0 + exp(-tg[n])) * tu[n];
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_router.comp b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_router.comp
+new file mode 100644
+index 0000000..f99d59d
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/lfm2_router.comp
+@@ -0,0 +1,57 @@
++#version 450
++
++// Fused MoE router front end for single-token decode. One workgroup per expert e:
++//   scale     = 1 / sqrt(mean(h^2) + eps)
++//   logits[e] = dot(W[e], h * g) * scale
++// and the workgroups together write xn = h * g * scale for the expert mat-vecs.
++// Replaces RMS_NORM + MUL + MUL_MAT (the top-k chain that follows is unchanged).
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++
++layout (push_constant) uniform parameter
++{
++    uint n;          // embedding size, a multiple of 4
++    uint n_expert;
++    float eps;
++    uint xn_chunk;   // xn elements written per workgroup, a multiple of 4
++} p;
++
++layout (binding = 0) readonly buffer H    {vec4 data_h[];};
++layout (binding = 1) readonly buffer G    {vec4 data_g[];};
++layout (binding = 2) readonly buffer W    {vec4 data_w[];};
++layout (binding = 3) writeonly buffer XN  {vec4 data_xn[];};
++layout (binding = 4) writeonly buffer LG  {float data_logits[];};
++
++layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++layout (constant_id = 0) const uint BLOCK_SIZE = 32;
++
++void main() {
++    const uint e = gl_WorkGroupID.x;
++    const uint tid = gl_LocalInvocationID.x;
++    const uint n4 = p.n / 4;
++    const uint wbase = e * n4;
++
++    float ss = 0.0;
++    float acc = 0.0;
++    for (uint i = tid; i < n4; i += BLOCK_SIZE) {
++        const vec4 h = data_h[i];
++        ss += dot(h, h);
++        acc += dot(data_w[wbase + i], h * data_g[i]);
++    }
++    ss = subgroupAdd(ss);
++    acc = subgroupAdd(acc);
++
++    const float scale = inversesqrt(ss / float(p.n) + p.eps);
++
++    if (tid == 0) {
++        data_logits[e] = acc * scale;
++    }
++
++    const uint c4 = p.xn_chunk / 4;
++    for (uint i = e * c4 + tid; i < min((e + 1) * c4, n4); i += BLOCK_SIZE) {
++        data_xn[i] = data_h[i] * data_g[i] * scale;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 3ec9cd0..ffb01a3 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1293,6 +1293,16 @@ void process_shaders() {
+ 
+     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+ 
++    // LFM2 single-token decode fusion kernels
++    string_to_spv("lfm2_conv_f32", "lfm2_conv.comp", {});
++    string_to_spv("lfm2_router_f32", "lfm2_router.comp", {});
++    string_to_spv("lfm2_moe_gateup_q4k_q4k", "lfm2_moe_gateup.comp", {});
++    string_to_spv("lfm2_moe_gateup_q5k_q4k", "lfm2_moe_gateup.comp", {{"GATE_Q5", "1"}});
++    string_to_spv("lfm2_moe_gateup_q4k_q5k", "lfm2_moe_gateup.comp", {{"UP_Q5", "1"}});
++    string_to_spv("lfm2_moe_gateup_q5k_q5k", "lfm2_moe_gateup.comp", {{"GATE_Q5", "1"}, {"UP_Q5", "1"}});
++    string_to_spv("lfm2_moe_down_q4k", "lfm2_moe_down.comp", {});
++    string_to_spv("lfm2_moe_down_q5k", "lfm2_moe_down.comp", {{"DOWN_Q5", "1"}});
++
+     // MoE expert cache matvec variants (Q8_0/Q4_0/Q4_K/Q6_K/Q5_K weights).
+     // Compiled separately per weight type; see moe_cache_mv.comp.
+     string_to_spv("moe_cache_mv_q8_0", "moe_cache_mv.comp", {{"MOE_CACHE_WTYPE", "1"}});
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index e550fbe..99afe81 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -2733,26 +2733,46 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
+         return;
+     }
+ 
+-    // Apply frequency and presence penalties to the cur_p
+-    for (size_t i = 0; i < cur_p->size; ++i) {
+-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+-        if (token_iter == ctx->token_count.end()) {
+-            continue;
+-        }
+-
+-        const int count = token_iter->second;
+-
++    const auto apply_penalty = [ctx](llama_token_data & td, const int count) {
+         assert(count > 0 && count <= ctx->penalty_last_n);
+ 
+         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
+         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
+-        if (cur_p->data[i].logit <= 0) {
+-            cur_p->data[i].logit *= ctx->penalty_repeat;
++        if (td.logit <= 0) {
++            td.logit *= ctx->penalty_repeat;
+         } else {
+-            cur_p->data[i].logit /= ctx->penalty_repeat;
++            td.logit /= ctx->penalty_repeat;
++        }
++
++        td.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
++    };
++
++    // Fast path: the candidates are usually still the full vocabulary in token order
++    // (data[id].id == id), so the handful of penalized tokens can be indexed directly
++    // instead of doing a hash lookup for every candidate.
++    bool indexed = true;
++    for (const auto & kv : ctx->token_count) {
++        const llama_token id = kv.first;
++        if (id < 0 || (size_t) id >= cur_p->size || cur_p->data[id].id != id) {
++            indexed = false;
++            break;
+         }
++    }
+ 
+-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
++    if (indexed) {
++        for (const auto & kv : ctx->token_count) {
++            apply_penalty(cur_p->data[kv.first], kv.second);
++        }
++    } else {
++        // Apply frequency and presence penalties to the cur_p
++        for (size_t i = 0; i < cur_p->size; ++i) {
++            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
++            if (token_iter == ctx->token_count.end()) {
++                continue;
++            }
++
++            apply_penalty(cur_p->data[i], token_iter->second);
++        }
+     }
+ 
+     cur_p->sorted = false;

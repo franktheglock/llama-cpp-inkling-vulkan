@@ -1,0 +1,128 @@
+#version 450
+
+// Fused MoE gate + up projection + SwiGLU for single-token decode:
+//   d[e][r] = silu(dot(gate[ids[e]][r], x)) * dot(up[ids[e]][r], x)
+// Replaces two MUL_MAT_ID dispatches and the GLU dispatch that joins them.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;            // K, a multiple of 256
+    uint nrows;            // rows per expert
+    uint blocks_per_expert;
+    uint n_used;
+    uint d_stride;         // output elements per expert slot
+} p;
+
+#ifdef GATE_Q5
+#define GATE_T   block_q5_K
+#define GATE_T16 block_q5_K_packed16
+#define GATE_T32 block_q5_K_packed32
+#else
+#define GATE_T   block_q4_K
+#define GATE_T16 block_q4_K_packed16
+#define GATE_T32 block_q4_K_packed32
+#endif
+
+#ifdef UP_Q5
+#define UP_T   block_q5_K
+#define UP_T16 block_q5_K_packed16
+#define UP_T32 block_q5_K_packed32
+#else
+#define UP_T   block_q4_K
+#define UP_T16 block_q4_K_packed16
+#define UP_T32 block_q4_K_packed32
+#endif
+
+layout (binding = 0) readonly buffer G   {GATE_T   data_g[];};
+layout (binding = 0) readonly buffer G16 {GATE_T16 data_g16[];};
+layout (binding = 0) readonly buffer G32 {GATE_T32 data_g32[];};
+layout (binding = 1) readonly buffer U   {UP_T   data_u[];};
+layout (binding = 1) readonly buffer U16 {UP_T16 data_u16[];};
+layout (binding = 1) readonly buffer U32 {UP_T32 data_u32[];};
+layout (binding = 2) readonly buffer X   {float data_x[];};
+layout (binding = 2) readonly buffer XV2 {vec2 data_x_v2[];};
+layout (binding = 2) readonly buffer XV4 {vec4 data_x_v4[];};
+layout (binding = 3) readonly buffer IDS {int data_ids[];};
+layout (binding = 4) writeonly buffer D  {float data_d[];};
+
+#define LFM2_X4(i) data_x_v4[(i) / 4]
+#define LFM2_X2(i) data_x_v2[(i) / 2]
+
+#define KQ_NAME dot_gate
+#define KQ_A    data_g
+#define KQ_A16  data_g16
+#define KQ_A32  data_g32
+#ifdef GATE_Q5
+#define KQ_Q5
+#endif
+#include "lfm2_kq_dot.glsl"
+#undef KQ_NAME
+#undef KQ_A
+#undef KQ_A16
+#undef KQ_A32
+#undef KQ_Q5
+
+#define KQ_NAME dot_up
+#define KQ_A    data_u
+#define KQ_A16  data_u16
+#define KQ_A32  data_u32
+#ifdef UP_Q5
+#define KQ_Q5
+#endif
+#include "lfm2_kq_dot.glsl"
+#undef KQ_NAME
+#undef KQ_A
+#undef KQ_A16
+#undef KQ_A32
+#undef KQ_Q5
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const uint NUM_ROWS = 2;
+
+void main() {
+    const uint slot = gl_WorkGroupID.y;
+    const uint expert = uint(data_ids[slot]);
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint nb = p.ncols / 256;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 16;
+    const uint ix = tid / 16;
+    const uint it_size = gl_WorkGroupSize.x / 16;
+
+    float tg[NUM_ROWS];
+    float tu[NUM_ROWS];
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        tg[n] = 0.0;
+        tu[n] = 0.0;
+        const uint row = min(first_row + n, p.nrows - 1);
+        const uint ib0 = expert * p.blocks_per_expert + row * nb;
+        for (uint i = ix; i < nb; i += it_size) {
+            tg[n] += dot_gate(ib0 + i, i * 256, itid);
+            tu[n] += dot_up(ib0 + i, i * 256, itid);
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        tg[n] = subgroupAdd(tg[n]);
+        tu[n] = subgroupAdd(tu[n]);
+    }
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint row = first_row + n;
+            if (row < p.nrows) {
+                data_d[slot * p.d_stride + row] = tg[n] / (1.0 + exp(-tg[n])) * tu[n];
+            }
+        }
+    }
+}

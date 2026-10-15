@@ -1,0 +1,57 @@
+#version 450
+
+// Fused MoE router front end for single-token decode. One workgroup per expert e:
+//   scale     = 1 / sqrt(mean(h^2) + eps)
+//   logits[e] = dot(W[e], h * g) * scale
+// and the workgroups together write xn = h * g * scale for the expert mat-vecs.
+// Replaces RMS_NORM + MUL + MUL_MAT (the top-k chain that follows is unchanged).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameter
+{
+    uint n;          // embedding size, a multiple of 4
+    uint n_expert;
+    float eps;
+    uint xn_chunk;   // xn elements written per workgroup, a multiple of 4
+} p;
+
+layout (binding = 0) readonly buffer H    {vec4 data_h[];};
+layout (binding = 1) readonly buffer G    {vec4 data_g[];};
+layout (binding = 2) readonly buffer W    {vec4 data_w[];};
+layout (binding = 3) writeonly buffer XN  {vec4 data_xn[];};
+layout (binding = 4) writeonly buffer LG  {float data_logits[];};
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+void main() {
+    const uint e = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n4 = p.n / 4;
+    const uint wbase = e * n4;
+
+    float ss = 0.0;
+    float acc = 0.0;
+    for (uint i = tid; i < n4; i += BLOCK_SIZE) {
+        const vec4 h = data_h[i];
+        ss += dot(h, h);
+        acc += dot(data_w[wbase + i], h * data_g[i]);
+    }
+    ss = subgroupAdd(ss);
+    acc = subgroupAdd(acc);
+
+    const float scale = inversesqrt(ss / float(p.n) + p.eps);
+
+    if (tid == 0) {
+        data_logits[e] = acc * scale;
+    }
+
+    const uint c4 = p.xn_chunk / 4;
+    for (uint i = e * c4 + tid; i < min((e + 1) * c4, n4); i += BLOCK_SIZE) {
+        data_xn[i] = data_h[i] * data_g[i] * scale;
+    }
+}

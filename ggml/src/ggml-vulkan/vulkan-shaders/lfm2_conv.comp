@@ -1,0 +1,47 @@
+#version 450
+
+// Fused LFM2 short-convolution block for single-token decode (per channel c):
+//   bx        = b[c] * x[c]                                  (b, c, x are the three chunks of in_proj)
+//   y[c]      = cgate[c] * (s0*k[0] + s1*k[1] + bx*k[2])     (s0, s1: recurrent conv state)
+//   state'[c] = (s1, bx)
+// Replaces MUL + GET_ROWS + CONCAT + CPY + SSM_CONV + MUL.
+
+layout (push_constant) uniform parameter
+{
+    uint n;          // channels
+    uint rs_stride;  // elements per recurrent-state row
+} p;
+
+layout (binding = 0) readonly buffer BCX  {float data_bcx[];};
+layout (binding = 1) readonly buffer SIN  {float data_sin[];};
+layout (binding = 2) readonly buffer KERN {float data_k[];};
+layout (binding = 3) readonly buffer IDS  {int data_ids[];};
+layout (binding = 4) writeonly buffer Y    {float data_y[];};
+layout (binding = 5) writeonly buffer SOUT {float data_sout[];};
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= p.n) {
+        return;
+    }
+
+    const uint srow = uint(data_ids[0]) * p.rs_stride;
+
+    const float b  = data_bcx[c];
+    const float cg = data_bcx[p.n + c];
+    const float x  = data_bcx[2 * p.n + c];
+    const float bx = b * x;
+
+    const float s0 = data_sin[srow + 2 * c];
+    const float s1 = data_sin[srow + 2 * c + 1];
+
+    float sum = s0 * data_k[3 * c];
+    sum += s1 * data_k[3 * c + 1];
+    sum += bx * data_k[3 * c + 2];
+
+    data_y[c] = cg * sum;
+    data_sout[2 * c]     = s1;
+    data_sout[2 * c + 1] = bx;
+}
