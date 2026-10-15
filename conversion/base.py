@@ -538,27 +538,8 @@ class ModelBase:
                     pass
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
-            elif quant_method == "modelopt":
-                # Mixed-precision ModelOpt models: NVFP4 tensors are handled by
-                # _generate_nvfp4_tensors; FP8 tensors have 1D weight_scale and
-                # are dequantized here. k/v scale tensors are unused.
-                for name in self.model_tensors.keys():
-                    if name.endswith(".weight_scale"):
-                        weight_name = name.removesuffix("_scale")
-                        if weight_name not in self.model_tensors:
-                            tensors_to_remove.append(name)
-                            continue
-                        w = self.model_tensors[weight_name]
-                        s = self.model_tensors[name]
-                        is_fp8_weight = False
-                        if self._fp8_as_q8:
-                            is_fp8_weight = w().dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                        self.model_tensors[weight_name] = lambda w=w, s=s: dequant_simple(w(), s(), None)
-                        tensors_to_remove.append(name)
-                        if is_fp8_weight:
-                            self._fp8_dequantized.add(weight_name)
-                    if name.endswith((".input_scale", ".k_scale", ".v_scale")):
-                        tensors_to_remove.append(name)
+            elif quant_method in ("modelopt", "modelopt_mixed"):
+                dequant_fp8()
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 

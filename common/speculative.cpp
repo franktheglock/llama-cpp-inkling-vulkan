@@ -1249,6 +1249,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
+            if (is_dflash2 || is_lilicorr) {
+                // Both DFlash and LiliCorr greedily walk the candidate lattice.
+                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                int32_t predecessor = 0;
+                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+                    const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
+                    const float * scores = row + top_k + (size_t) predecessor * top_k;
+
+                    predecessor = (int32_t) std::distance(scores,
+                            std::max_element(scores, scores + top_k));
+                    if (params.p_min > 0.0f) {
+                        // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < top_k; ++k) {
+                            sum += std::exp(scores[k] - scores[predecessor]);
+                        }
+                        if (1.0f / sum < params.p_min) {
+                            break;
+                        }
+                    }
+                    result.push_back((llama_token) row[predecessor]);
+                }
+
+                if (result.size() < (size_t) params.n_min) {
+                    result.clear();
+                }
+                continue;
+            }
+
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
