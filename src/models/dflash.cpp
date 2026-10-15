@@ -460,20 +460,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-    ggml_tensor * inp_anchor = nullptr;
-    if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
-        // LiliCorr sets inp_anchor to pass the context features to the lattice scorer
-        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
-        inp->tokens = inp_tokens;
-        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->h);
-        inp_anchor = inp->h;
-        res->add_input(std::move(inp));
-    } else {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
-        inp->tokens = inp_tokens;
-        res->add_input(std::move(inp));
-    }
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
 
     ggml_tensor * inp_tokens = inp->tokens;
 
@@ -588,12 +576,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // DSpark: bias the draft logits with the Markov head
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
-    }
-
-    if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
-    } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
-        build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
     }
 }
 

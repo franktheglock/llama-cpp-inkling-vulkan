@@ -2365,6 +2365,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_build_forward_expand(gf, experts);
 
+    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+
     assert(n_expert_used > 0);
 
     // order the views before the adds
