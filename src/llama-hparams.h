@@ -158,6 +158,12 @@ struct llama_hparams {
     // by default, all layers are dense
     // note: using uint32_t type for compatibility reason
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_swa_impl;
+    // per-layer rope flag (0 = layer has no positional encoding); default: all layers use rope
+    std::array<uint32_t, LLAMA_MAX_LAYERS> rope_pattern = [] {
+        std::array<uint32_t, LLAMA_MAX_LAYERS> a{};
+        a.fill(1);
+        return a;
+    }();
 
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;
@@ -411,6 +417,9 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+
+    // does layer il use a positional encoding?
+    bool has_rope(uint32_t il) const;
     // number of layers with KV cache
     uint32_t n_layer_kv() const;
 
