@@ -1592,6 +1592,40 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
+          ggml_tensor * cur) const {
+    llm_graph_amax_src1 result = {
+        /*.res     =*/ cur,
+        /*.scale_s =*/ nullptr,
+    };
+
+    const int64_t n_embd = cur->ne[0];
+
+    // amax = max|cur| along the rows for each [expert, token] -> [1, n_expert, n_tokens]
+    ggml_tensor * ab = ggml_abs(ctx0, cur);
+    ggml_tensor * amax = ggml_pool_1d(ctx0, ab, GGML_OP_POOL_MAX, n_embd, n_embd, 0);
+
+    // ref: https://github.com/ggml-org/llama.cpp/pull/26223
+    constexpr float k_log2_e = 1.4426950408889634f; // 1 / ln(2)
+    constexpr float k_ln_2   = 0.6931471805599453f;
+
+    ggml_tensor * e;
+    e = ggml_scale(ctx0, amax, 1.0f/32768.0f);
+    e = ggml_log  (ctx0, e);
+    e = ggml_scale(ctx0, e, k_log2_e);
+    e = ggml_ceil (ctx0, e);
+    e = ggml_clamp(ctx0, e, 0.0f, 127.0f);
+    e = ggml_scale(ctx0, e, k_ln_2);
+    e = ggml_exp  (ctx0, e);
+
+    result = {
+        /*.res     =*/ ggml_div(ctx0, cur, e),
+        /*.scale_s =*/ e,
+    };
+
+    return result;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -2337,6 +2371,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Direct path by default (CUDA-first). Metal-only L2 rescale when needed
     // (see llm_sched_needs_moe_f16_act_guard). Mathematically identity on Metal;
     // keeps f16 MUL_MAT_ID acts under 65504.
+    llm_graph_amax_src1 amax_src1 = { nullptr, nullptr };
+
+    if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM) {
+        amax_src1 = build_amax_src1_f16(cur);
+        cur = amax_src1.res;
+    }
+
     if (llm_sched_needs_moe_f16_act_guard(sched)) {
         const float f16_safe = 32768.0f; // stay well under the f16 max of 65504
         ggml_tensor * col_l2 = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur))); // [1, n_expert_used, n_tokens]
@@ -2347,7 +2388,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     }
+
     cb(experts, "ffn_moe_down", il);
+
+    if (amax_src1.scale_s) {
+        experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
