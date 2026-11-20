@@ -2726,7 +2726,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_INKLING2) {
 
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        // looped layers reuse their tensors once per pass
+        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors()) * std::max<uint32_t>(1u, model.hparams.loop_n_pass);
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
     for (const auto & lora : model.loras) {

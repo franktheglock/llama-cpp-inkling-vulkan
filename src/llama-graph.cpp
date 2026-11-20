@@ -2436,6 +2436,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 const float beta = hparams.situ_beta;
                 const float lb   = hparams.situ_linear_beta;
 
+                // fused gate_up gives strided views; this fork's scale kernels need contiguous input
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                if (!ggml_is_contiguous(up))  { up  = ggml_cont(ctx0, up);  }
+
                 ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
                 act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
                 if (lb > 0.0f) {
