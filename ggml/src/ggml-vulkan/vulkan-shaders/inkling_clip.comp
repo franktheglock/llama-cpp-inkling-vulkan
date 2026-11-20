@@ -1,0 +1,51 @@
+#version 450
+
+// Inkling 2 row clip: y = x*scale; y *= clamp(thr/(|y| + 1e-6), 0, 1) * tau[t]. One subgroup-sized workgroup per row.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameter {
+    uint d; uint rows_per_t; uint n_rows; uint has_scale; uint has_tau; float thr;
+} p;
+
+layout (binding = 0) readonly  buffer X   {float data_x[];};
+layout (binding = 1) readonly  buffer S   {float data_s[];};
+layout (binding = 2) readonly  buffer TAU {float data_tau[];};
+layout (binding = 3) writeonly buffer D   {float data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint row = gl_WorkGroupID.y*512 + gl_WorkGroupID.x;
+    if (row >= p.n_rows) {
+        return;
+    }
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint base = row*p.d;
+    const uint sbase = p.has_scale == 2 ? (row % p.rows_per_t)*p.d : 0;
+
+    float ss = 0.0;
+    for (uint i = tid; i < p.d; i += BLOCK_SIZE) {
+        float v = data_x[base + i];
+        if (p.has_scale != 0) {
+            v *= data_s[sbase + i];
+        }
+        ss += v*v;
+    }
+    ss = subgroupAdd(ss);
+
+    float factor = clamp(p.thr/(sqrt(ss) + 1e-6), 0.0, 1.0);
+    if (p.has_tau != 0) {
+        factor *= data_tau[row/p.rows_per_t];
+    }
+    for (uint i = tid; i < p.d; i += BLOCK_SIZE) {
+        float v = data_x[base + i];
+        if (p.has_scale != 0) {
+            v *= data_s[sbase + i];
+        }
+        data_d[base + i] = v*factor;
+    }
+}

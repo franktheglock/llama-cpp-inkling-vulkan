@@ -592,6 +592,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_INKLING,  // fused Inkling 2 helpers, sub-op in op_params[0] (enum ggml_inkling_op)
 
         GGML_OP_UNARY,
 
@@ -2636,7 +2637,63 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
-            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+            struct ggml_tensor  * scale);
+
+    // fused Inkling 2 graph helpers (GGML_OP_INKLING), exact rewrites of chains of stock ops
+    enum ggml_inkling_op {
+        GGML_INKLING_CLIP    = 0, // y = x*scale; y *= min(1, thr/(|y|_row + 1e-6)); y *= tau[t]
+        GGML_INKLING_MIX     = 1, // depth attention over rms-normalized states with learned queries
+        GGML_INKLING_CONV    = 2, // short causal conv with residual, optional dynamic per-head taps, output scale
+        GGML_INKLING_GATE    = 3, // (1 - tanh(f))*cur + tanh(g)*msg
+        GGML_INKLING_RELMASK = 4, // mask + table[rel_pos] - sink, per head
+    };
+
+    // x: [d, rows_per_token, T] f32 contiguous; scale: [d] or [d, rows_per_token] or NULL; tau: [T] or NULL
+    GGML_API struct ggml_tensor * ggml_inkling_clip(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * tau,
+            float                 threshold);
+
+    // query: [n_embd, nq]; cur: [n_embd, T]; blocks: n_blocks x [n_embd, T] (n_blocks <= 8)
+    // result: [n_embd, T, nq] (one contiguous [n_embd, T] slice per query)
+    GGML_API struct ggml_tensor * ggml_inkling_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor ** blocks,
+            int                   n_blocks,
+            float                 eps);
+
+    // x: [n_conv - 1 + n_seq_tokens, C, n_seqs] (concat of the history and the transposed input)
+    // weight: [n_conv, C]; dynamic: [n_conv*n_heads, n_seq_tokens*n_seqs] or NULL
+    // result: [C, n_seq_tokens*n_seqs] = (x_last + conv(x) + dyn(x)) * out_scale
+    GGML_API struct ggml_tensor * ggml_inkling_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * dynamic,
+            float                 out_scale);
+
+    // all [n, T] f32 contiguous
+    GGML_API struct ggml_tensor * ggml_inkling_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * f,
+            struct ggml_tensor  * g);
+
+    // table: [n_ext, n_head, T] f32; sinks: [n_head, T] f32; rel_pos: [n_kv, T] i32 (values < n_ext, n_ext-1 = zero row)
+    // mask: [n_kv, T/n_stream, 1, n_stream] f16/f32; result: [n_kv, T/n_stream, n_head, n_stream] of type `type`
+    // result[j, t, h] = mask[j, t] + (rel_pos[j, t] < n_ext ? table[rel_pos[j, t], h, t] : 0) - sinks[h, t]   (rel_pos <= n_ext)
+    GGML_API struct ggml_tensor * ggml_inkling_relmask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
+            enum ggml_type        type);        // NULL = no InnerQ scaling
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

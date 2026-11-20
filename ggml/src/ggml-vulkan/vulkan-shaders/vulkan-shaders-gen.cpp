@@ -1296,6 +1296,14 @@ void process_shaders() {
     // LFM2 single-token decode fusion kernels
     string_to_spv("lfm2_conv_f32", "lfm2_conv.comp", {});
     string_to_spv("lfm2_router_f32", "lfm2_router.comp", {});
+    string_to_spv("inkling_clip_f32", "inkling_clip.comp", {});
+    string_to_spv("inkling_mix_f32",  "inkling_mix.comp",  {});
+    string_to_spv("inkling_conv_f32", "inkling_conv.comp", {});
+    string_to_spv("inkling_gate_f32", "inkling_gate.comp", {});
+    string_to_spv("inkling_relmask_f16_f16", "inkling_relmask.comp", {{"MASK_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("inkling_relmask_f16_f32", "inkling_relmask.comp", {{"MASK_TYPE", "float16_t"}, {"D_TYPE", "float"}});
+    string_to_spv("inkling_relmask_f32_f16", "inkling_relmask.comp", {{"MASK_TYPE", "float"},     {"D_TYPE", "float16_t"}});
+    string_to_spv("inkling_relmask_f32_f32", "inkling_relmask.comp", {{"MASK_TYPE", "float"},     {"D_TYPE", "float"}});
     string_to_spv("lfm2_moe_gateup_q4k_q4k", "lfm2_moe_gateup.comp", {});
     string_to_spv("lfm2_moe_gateup_q5k_q4k", "lfm2_moe_gateup.comp", {{"GATE_Q5", "1"}});
     string_to_spv("lfm2_moe_gateup_q4k_q5k", "lfm2_moe_gateup.comp", {{"UP_Q5", "1"}});

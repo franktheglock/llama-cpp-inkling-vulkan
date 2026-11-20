@@ -4076,6 +4076,18 @@ ggml_tensor * llm_graph_context::build_attn(
     return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
 }
 
+ggml_tensor * llm_graph_context::build_attn_premasked(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_mask_full,
+        ggml_tensor * sinks,
+            float     kq_scale,
+            int       il) const {
+    return build_attn_iswa_impl(*this, inp->get_attn(), nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, nullptr, kq_mask_full, sinks, nullptr, kq_scale, il);
+}
+
 void llm_graph_context::build_dense_out(
     ggml_tensor * dense_2,
     ggml_tensor * dense_2_b,

@@ -1,0 +1,37 @@
+#version 450
+
+// Inkling 2 relative-position mask: out[j, t, h, s] = mask[j, t, s] + table[rel[j, tg], h, tg] - sinks[h, tg], tg = s*T_s + t
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout (push_constant) uniform parameter {
+    uint n_kv; uint T_s; uint n_head; uint n_str; uint n_ext;
+    uint m_nb1; uint m_nb3; uint n_rows;
+} p;
+
+layout (binding = 0) readonly  buffer TB  {float data_tb[];};
+layout (binding = 1) readonly  buffer SK  {float data_sk[];};
+layout (binding = 2) readonly  buffer RP  {int   data_rp[];};
+layout (binding = 3) readonly  buffer M   {MASK_TYPE data_m[];};
+layout (binding = 4) writeonly buffer D   {D_TYPE data_d[];};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint j   = gl_GlobalInvocationID.x;
+    const uint row = gl_WorkGroupID.y + gl_WorkGroupID.z*65535;
+    if (j >= p.n_kv || row >= p.n_rows) {
+        return;
+    }
+    const uint t  = row % p.T_s;
+    const uint h  = (row/p.T_s) % p.n_head;
+    const uint s  = row/(p.T_s*p.n_head);
+    const uint tg = s*p.T_s + t;
+
+    const float m = float(data_m[t*p.m_nb1 + s*p.m_nb3 + j]);
+    const uint  r = uint(data_rp[tg*p.n_kv + j]);
+    const float b = r < p.n_ext ? data_tb[(tg*p.n_head + h)*p.n_ext + r] : 0.0;
+    const float v = m + b - data_sk[tg*p.n_head + h];
+    data_d[row*p.n_kv + j] = D_TYPE(v);
+}

@@ -1164,6 +1164,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "INKLING",
 
     "UNARY",
 
@@ -1181,7 +1182,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1280,6 +1281,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "inkling(x)",
 
     "unary(x)",
 
@@ -1297,7 +1299,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6414,6 +6416,129 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+// ggml_inkling_*
+
+struct ggml_tensor * ggml_inkling_clip(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * tau,
+        float                 threshold) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[3] == 1);
+    GGML_ASSERT(!scale || (scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) &&
+                (ggml_nelements(scale) == x->ne[0] || ggml_nelements(scale) == x->ne[0]*x->ne[1])));
+    GGML_ASSERT(!tau   || (tau->type   == GGML_TYPE_F32 && ggml_nelements(tau)   == x->ne[2] && ggml_is_contiguous(tau)));
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_CLIP);
+    ggml_set_op_params_f32(result, 1, threshold);
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = x;
+    result->src[1] = scale;
+    result->src[2] = tau;
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor ** blocks,
+        int                   n_blocks,
+        float                 eps) {
+    GGML_ASSERT(n_blocks >= 0 && n_blocks <= GGML_MAX_SRC - 2);
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && cur->type == GGML_TYPE_F32);
+    const int64_t n_embd = cur->ne[0];
+    const int64_t T      = ggml_nelements(cur)/n_embd;
+    GGML_ASSERT(query->ne[0] == n_embd && ggml_is_contiguous(cur) && ggml_is_contiguous_rows(query));
+    for (int i = 0; i < n_blocks; ++i) {
+        GGML_ASSERT(blocks[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(blocks[i]) && ggml_nelements(blocks[i]) == n_embd*T);
+    }
+    const int64_t nq = ggml_nelements(query)/n_embd;
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, T, nq);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_MIX);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_i32(result, 2, n_blocks);
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = query;
+    result->src[1] = cur;
+    for (int i = 0; i < n_blocks; ++i) {
+        result->src[2 + i] = blocks[i];
+    }
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * dynamic,
+        float                 out_scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    const int64_t n_conv = weight->ne[0];
+    const int64_t C      = weight->ne[1];
+    GGML_ASSERT(x->ne[1] == C && x->ne[0] >= n_conv && x->nb[0] == sizeof(float) && ggml_is_contiguous(weight));
+    const int64_t n_t = x->ne[0] - (n_conv - 1);
+    const int64_t T   = n_t*x->ne[2];
+    if (dynamic) {
+        GGML_ASSERT(dynamic->type == GGML_TYPE_F32 && ggml_is_contiguous(dynamic) && dynamic->ne[1] == T);
+        GGML_ASSERT(dynamic->ne[0] % n_conv == 0 && C % (dynamic->ne[0]/n_conv) == 0);
+    }
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_CONV);
+    ggml_set_op_params_f32(result, 1, out_scale);
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = x;
+    result->src[1] = weight;
+    result->src[2] = dynamic;
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg,
+        struct ggml_tensor  * f,
+        struct ggml_tensor  * g) {
+    struct ggml_tensor * srcs[4] = { cur, msg, f, g };
+    for (int i = 0; i < 4; ++i) {
+        GGML_ASSERT(srcs[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(srcs[i]) && ggml_nelements(srcs[i]) == ggml_nelements(cur));
+    }
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, cur->ne);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_GATE);
+    result->op = GGML_OP_INKLING;
+    for (int i = 0; i < 4; ++i) {
+        result->src[i] = srcs[i];
+    }
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_relmask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * sinks,
+        struct ggml_tensor  * rel_pos,
+        struct ggml_tensor  * mask,
+        enum ggml_type        type) {
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
+    GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks));
+    GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(rel_pos));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    const int64_t n_head = table->ne[1];
+    const int64_t T      = table->ne[2];
+    const int64_t n_kv   = rel_pos->ne[0];
+    GGML_ASSERT(rel_pos->ne[1] == T && ggml_nelements(sinks) == n_head*T);
+    GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[2] == 1 && mask->ne[1]*mask->ne[3] == T);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_kv, mask->ne[1], n_head, mask->ne[3]);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_RELMASK);
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = table;
+    result->src[1] = sinks;
+    result->src[2] = rel_pos;
+    result->src[3] = mask;
     return result;
 }
 

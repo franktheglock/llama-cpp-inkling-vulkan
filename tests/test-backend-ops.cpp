@@ -2585,6 +2585,69 @@ struct test_set_rows : public test_case {
 };
 
 // GGML_OP_TURBO_WHT
+// GGML_OP_INKLING (fused Inkling 2 helpers)
+struct test_inkling : public test_case {
+    const int mode;
+    const int64_t a, b, T;   // mode-specific sizes
+    const int extra;         // clip: flags (1 scale, 2 tau); mix: n_blocks*8 + nq; conv: dyn heads; relmask: mask f16*2 + out f16
+
+    std::string vars() override { return VARS_TO_STR5(mode, a, b, T, extra); }
+
+    test_inkling(int mode = 0, int64_t a = 128, int64_t b = 8, int64_t T = 1, int extra = 0) : mode(mode), a(a), b(b), T(T), extra(extra) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        switch (mode) {
+            case GGML_INKLING_CLIP: {
+                ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, T);
+                ggml_tensor * sc = (extra & 1) ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a) : (extra & 4) ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, b) : nullptr;
+                ggml_tensor * tau = (extra & 2) ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, T) : nullptr;
+                return ggml_inkling_clip(ctx, x, sc, tau, 4.0f);
+            }
+            case GGML_INKLING_MIX: {
+                const int nb = extra/8, nq = extra%8;
+                ggml_tensor * q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, nq);
+                ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                ggml_tensor * blocks[8];
+                for (int i = 0; i < nb; ++i) blocks[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                return ggml_inkling_mix(ctx, q, c, blocks, nb, 1e-6f);
+            }
+            case GGML_INKLING_CONV: {
+                const int64_t K = 4;
+                ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K - 1 + T, a, b);
+                ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, a);
+                ggml_tensor * dyn = extra ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K*extra, T*b) : nullptr;
+                return ggml_inkling_conv(ctx, x, w, dyn, 0.3f);
+            }
+            case GGML_INKLING_GATE: {
+                ggml_tensor * t[4];
+                for (int i = 0; i < 4; ++i) t[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                return ggml_inkling_gate(ctx, t[0], t[1], t[2], t[3]);
+            }
+            default: {
+                const int64_t n_ext = 32, n_head = b, n_kv = a;
+                ggml_tensor * tb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ext, n_head, T);
+                ggml_tensor * sk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, T);
+                ggml_tensor * rp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, T);
+                ggml_set_name(rp, "rel_pos");
+                ggml_tensor * m  = ggml_new_tensor_4d(ctx, (extra & 2) ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv, T, 1, 1);
+                return ggml_inkling_relmask(ctx, tb, sk, rp, m, (extra & 1) ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) x = rand() % 33;
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
 struct test_turbo_wht : public test_case {
     const int64_t head_dim;
     const int64_t n_heads;
@@ -8969,6 +9032,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
 
     // TURBO_WHT tests
+    for (int64_t T : {1, 7, 64}) {
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CLIP, 128, 24, T, 0));
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CLIP, 128, 24, T, 3));
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CLIP, 64,  8,  T, 1));
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CLIP, 128, 24, T, 6));
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CLIP, 16,  24, T, 4));
+        for (int nb : {0, 1, 4, 8}) {
+            for (int nq : {1, 2, 3}) {
+                test_cases.emplace_back(new test_inkling(GGML_INKLING_MIX, 2304, 0, T, nb*8 + nq));
+            }
+        }
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CONV, 1024, 1, T, 0));
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CONV, 1024, 1, T, 8));
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_CONV, 2304, 2, T, 0));
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_GATE, 2304, 0, T, 0));
+        for (int e : {0, 1, 2, 3}) {
+            test_cases.emplace_back(new test_inkling(GGML_INKLING_RELMASK, 256, 24, T, e));
+        }
+    }
     for (int dir : {0, 1}) {
         for (int64_t hd : {128, 256, 512}) {
             for (int64_t nh : {1, 4, 8}) {
@@ -10821,6 +10903,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int nb : {0, 1, 2, 4}) {
+        test_cases.emplace_back(new test_inkling(GGML_INKLING_MIX, 2304, 0, 1, nb*8 + 1));
+    }
+    test_cases.emplace_back(new test_inkling(GGML_INKLING_CLIP, 128, 24, 1, 6));
+    test_cases.emplace_back(new test_inkling(GGML_INKLING_CONV, 1024, 1, 1, 0));
+    test_cases.emplace_back(new test_inkling(GGML_INKLING_GATE, 2304, 0, 1, 0));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {2304, 1, 1, 1}));
+
 
     // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));

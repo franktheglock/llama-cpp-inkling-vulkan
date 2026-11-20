@@ -11345,6 +11345,181 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_inkling: reference implementations of the fused Inkling 2 helpers (see ggml.h)
+
+static void ggml_inkling_clip_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * tau   = dst->src[2];
+    const float thr = ggml_get_op_params_f32(dst, 1);
+    const int64_t d      = x->ne[0];
+    const int64_t n_rows = ggml_nrows(x);
+    const int64_t rows_per_t = x->ne[1];
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const float * xr = (const float *) x->data + r*d;
+        float       * yr = (float       *) dst->data + r*d;
+        double ss = 0.0;
+        for (int64_t i = 0; i < d; ++i) {
+            const float v = scale ? xr[i]*((const float *) scale->data)[i + (ggml_nelements(scale) == d ? 0 : (r % rows_per_t)*d)] : xr[i];
+            yr[i] = v;
+            ss += (double) v*v;
+        }
+        const float norm   = sqrtf((float) ss) + 1e-6f;
+        float       factor = thr/norm;
+        factor = factor < 0.0f ? 0.0f : (factor > 1.0f ? 1.0f : factor);
+        if (tau) {
+            factor *= ((const float *) tau->data)[r/rows_per_t];
+        }
+        for (int64_t i = 0; i < d; ++i) {
+            yr[i] *= factor;
+        }
+    }
+}
+
+static void ggml_inkling_mix_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * query = dst->src[0];
+    const ggml_tensor * cur   = dst->src[1];
+    const float eps      = ggml_get_op_params_f32(dst, 1);
+    const int   n_blocks = ggml_get_op_params_i32(dst, 2);
+    const int64_t n_embd = dst->ne[0];
+    const int64_t T      = dst->ne[1];
+    const int64_t nq     = dst->ne[2];
+    const int     n_st   = n_blocks + 1;
+    GGML_ASSERT(nq <= 8);
+    const float kscale = 1.0f/sqrtf((float) n_embd);
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        const float * st[GGML_MAX_SRC];
+        float rinv[GGML_MAX_SRC];
+        for (int s = 0; s < n_st; ++s) {
+            const ggml_tensor * src = s < n_blocks ? dst->src[2 + s] : cur;
+            st[s] = (const float *) src->data + t*n_embd;
+            double ss = 0.0;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                ss += (double) st[s][e]*st[s][e];
+            }
+            rinv[s] = 1.0f/sqrtf((float) (ss/n_embd) + eps);
+        }
+        for (int64_t q = 0; q < nq; ++q) {
+            const float * qv = (const float *) ((const char *) query->data + q*query->nb[1]);
+            float p[GGML_MAX_SRC];
+            float mx = -INFINITY;
+            for (int s = 0; s < n_st; ++s) {
+                double dot = 0.0;
+                for (int64_t e = 0; e < n_embd; ++e) {
+                    dot += (double) st[s][e]*qv[e];
+                }
+                p[s] = (float) dot*rinv[s]*kscale;
+                mx = p[s] > mx ? p[s] : mx;
+            }
+            float sum = 0.0f;
+            for (int s = 0; s < n_st; ++s) {
+                p[s] = expf(p[s] - mx);
+                sum += p[s];
+            }
+            float * out = (float *) dst->data + (q*T + t)*n_embd;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                float acc = 0.0f;
+                for (int s = 0; s < n_st; ++s) {
+                    acc += p[s]/sum*rinv[s]*st[s][e];
+                }
+                out[e] = acc;
+            }
+        }
+    }
+}
+
+static void ggml_inkling_conv_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * w   = dst->src[1];
+    const ggml_tensor * dyn = dst->src[2];
+    const float out_scale = ggml_get_op_params_f32(dst, 1);
+    const int64_t n_conv = w->ne[0];
+    const int64_t C      = w->ne[1];
+    const int64_t n_t    = x->ne[0] - (n_conv - 1);
+    const int64_t n_s    = x->ne[2];
+    const int64_t H      = dyn ? dyn->ne[0]/n_conv : 0;
+    const int64_t ch_per_head = H ? C/H : 1;
+    for (int64_t c = params->ith; c < C; c += params->nth) {
+        const float * wc = (const float *) w->data + c*n_conv;
+        for (int64_t s = 0; s < n_s; ++s) {
+            const float * xc = (const float *) ((const char *) x->data + c*x->nb[1] + s*x->nb[2]);
+            for (int64_t t = 0; t < n_t; ++t) {
+                const int64_t tg = s*n_t + t;
+                float acc = xc[t + n_conv - 1];
+                for (int64_t k = 0; k < n_conv; ++k) {
+                    acc += wc[k]*xc[t + k];
+                }
+                if (dyn) {
+                    const float * dt = (const float *) dyn->data + tg*dyn->ne[0] + (c/ch_per_head)*n_conv;
+                    for (int64_t lag = 0; lag < n_conv; ++lag) {
+                        acc += dt[lag]*xc[t + n_conv - 1 - lag];
+                    }
+                }
+                ((float *) dst->data)[tg*C + c] = acc*out_scale;
+            }
+        }
+    }
+}
+
+static void ggml_inkling_gate_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const float * cur = (const float *) dst->src[0]->data;
+    const float * msg = (const float *) dst->src[1]->data;
+    const float * f   = (const float *) dst->src[2]->data;
+    const float * g   = (const float *) dst->src[3]->data;
+    float * y = (float *) dst->data;
+    const int64_t n = ggml_nelements(dst);
+    const int64_t chunk = (n + params->nth - 1)/params->nth;
+    const int64_t i0 = chunk*params->ith;
+    const int64_t i1 = MIN(n, i0 + chunk);
+    for (int64_t i = i0; i < i1; ++i) {
+        y[i] = (1.0f - tanhf(f[i]))*cur[i] + tanhf(g[i])*msg[i];
+    }
+}
+
+static void ggml_inkling_relmask_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * table = dst->src[0];
+    const ggml_tensor * sinks = dst->src[1];
+    const ggml_tensor * rel   = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const int64_t n_ext  = table->ne[0];
+    const int64_t n_head = table->ne[1];
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t T_s    = dst->ne[1];
+    const int64_t n_str  = dst->ne[3];
+    const int64_t n_rows = T_s*n_head*n_str;
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const int64_t t = r % T_s;
+        const int64_t h = (r/T_s) % n_head;
+        const int64_t s = r/(T_s*n_head);
+        const int64_t tg = s*T_s + t;
+        const float sink = ((const float *) sinks->data)[tg*n_head + h];
+        const float * tb = (const float *) table->data + (tg*n_head + h)*n_ext;
+        const int32_t * rp = (const int32_t *) rel->data + tg*n_kv;
+        const char * mrow = (const char *) mask->data + t*mask->nb[1] + s*mask->nb[3];
+        char * drow = (char *) dst->data + t*dst->nb[1] + h*dst->nb[2] + s*dst->nb[3];
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const float m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mrow)[j]) : ((const float *) mrow)[j];
+            const float v = m + (rp[j] < n_ext ? tb[rp[j]] : 0.0f) - sink;
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) drow)[j] = GGML_CPU_FP32_TO_FP16(v);
+            } else {
+                ((float *) drow)[j] = v;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tensor * dst) {
+    switch ((enum ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
+        case GGML_INKLING_CLIP:    ggml_inkling_clip_f32   (params, dst); break;
+        case GGML_INKLING_MIX:     ggml_inkling_mix_f32    (params, dst); break;
+        case GGML_INKLING_CONV:    ggml_inkling_conv_f32   (params, dst); break;
+        case GGML_INKLING_GATE:    ggml_inkling_gate_f32   (params, dst); break;
+        case GGML_INKLING_RELMASK: ggml_inkling_relmask_f32(params, dst); break;
+        default: GGML_ABORT("unknown inkling op");
+    }
+}
+
 // ggml_compute_forward_turbo_wht
 
 // WHT sign arrays (must match Metal shader turbo_wht_signs1/2)

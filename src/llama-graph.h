@@ -1402,6 +1402,17 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
+    // kq_mask_full: the complete per-head mask (input mask + relative bias), already built by the caller (Inkling fused path)
+    ggml_tensor * build_attn_premasked(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_mask_full,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il) const;
+
     // kq_b is added to the KQ mask, after the KQ scale
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
