@@ -3774,6 +3774,13 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    // hybrid memory with SWA (e.g. Inkling 2: SWA KV + short-conv state): the reported
+                                    // pos_min is the recurrent one (== pos_max), but a checkpoint still holds the full
+                                    // SWA window before its pos_max, so any checkpoint at or before pos_next can resume
+                                    const bool ckpt_any_before = n_swa > 0 && (
+                                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3785,7 +3792,7 @@ private:
                                             if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0 || ckpt_any_before;
                                         }
                                     );
 
