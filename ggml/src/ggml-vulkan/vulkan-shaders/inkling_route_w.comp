@@ -1,0 +1,31 @@
+#version 450
+
+// Inkling 2 MoE routing weights: p = sigmoid(logits[ids]); w = p/(sum(p) + eps)*scale. One subgroup per token.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameter { uint n_exp; uint k; uint T; float eps; float scale; } p;
+
+layout (binding = 0) readonly  buffer L  {float data_l[];};
+layout (binding = 1) readonly  buffer ID {int   data_ids[];};
+layout (binding = 2) writeonly buffer D  {float data_d[];};
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+void main() {
+    const uint t = gl_WorkGroupID.x + gl_WorkGroupID.y*65535;
+    const uint e = gl_LocalInvocationID.x;
+    if (t >= p.T) {
+        return;
+    }
+    float pe = 0.0;
+    if (e < p.k) {
+        pe = 1.0/(1.0 + exp(-data_l[t*p.n_exp + uint(data_ids[t*p.k + e])]));
+    }
+    const float sum = subgroupAdd(pe);
+    if (e < p.k) {
+        data_d[t*p.k + e] = pe/(sum + p.eps)*p.scale;
+    }
+}

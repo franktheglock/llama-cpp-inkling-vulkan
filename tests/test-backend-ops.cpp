@@ -2667,6 +2667,13 @@ struct test_inkling : public test_case {
                 for (int i = 0; i < nb; ++i) blocks[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
                 return ggml_inkling_mix2(ctx, q, c, blocks, nb, 1e-6f);
             }
+            case 13: {
+                ggml_tensor * l = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                ggml_tensor * bb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a);
+                ggml_tensor * ids = ggml_inkling_route_ids(ctx, l, bb, b);
+                // compare through the routing weights (float), which depend on the selection
+                return ggml_inkling_route_w(ctx, l, ids, 1e-20f, 2.5f);
+            }
             case 10: {
                 ggml_tensor * y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, T);
                 ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, b, T);
@@ -9114,6 +9121,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 2));
         test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 3));
         test_cases.emplace_back(new test_inkling(10, 2304, 8, T, 0));
+        test_cases.emplace_back(new test_inkling(13, 128, 8, T, 0));
+        test_cases.emplace_back(new test_inkling(13, 256, 16, T, 0));
         for (int nb : {0, 1, 4, 8}) for (int nq : {1, 2, 3}) test_cases.emplace_back(new test_inkling(11, 2304, 0, T, nb*8 + nq));
         test_cases.emplace_back(new test_inkling(10, 2304, 8, T, 1));
         for (int e : {0, 1, 2, 3}) {

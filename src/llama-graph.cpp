@@ -2190,6 +2190,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    ggml_tensor * fused_route_ids = nullptr;
+    ggml_tensor * fused_route_w   = nullptr;
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2205,6 +2207,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (gate_inp_b) {
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
+    }
+
+    // Inkling 2: sigmoid + bias top-k and the normalized weights in two kernels
+    if (arch == LLM_ARCH_INKLING2 && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID && exp_probs_b && !gate_inp_b &&
+        probs_in == nullptr && selected_experts_in == nullptr && hparams.n_expert_groups <= 1 && norm_w &&
+        hparams.expert_weights_norm_eps > 0.0f && getenv("INKLING_UNFUSED") == nullptr && getenv("INKLING_NO_ROUTE") == nullptr) {
+        ggml_tensor * ids = ggml_inkling_route_ids(ctx0, logits, exp_probs_b, (int) n_expert_used);
+        cb(ids, "ffn_moe_topk", il);
+        ggml_tensor * w = ggml_inkling_route_w(ctx0, logits, ids, hparams.expert_weights_norm_eps,
+                (w_scale != 0.0f) ? w_scale : 1.0f);
+        cb(w, "ffn_moe_weights", il);
+        fused_route_ids = ids;
+        fused_route_w   = w;
     }
 
     ggml_tensor * probs = nullptr;
@@ -2324,6 +2339,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (fused_route_ids) {
+        selected_experts = fused_route_ids;
+        weights          = fused_route_w;
     }
 
     //call early so that topk-moe can be used

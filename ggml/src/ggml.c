@@ -6735,6 +6735,39 @@ struct ggml_tensor * ggml_inkling_mix2(
     return result;
 }
 
+struct ggml_tensor * ggml_inkling_route_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * bias,
+        int                   k) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits) && bias->type == GGML_TYPE_F32 && ggml_nelements(bias) == logits->ne[0]);
+    GGML_ASSERT(k > 0 && k <= logits->ne[0] && k <= 32 && logits->ne[0] <= 1024);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, ggml_nrows(logits));
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_ROUTE_IDS);
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = logits;
+    result->src[1] = bias;
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_route_w(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * ids,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits) && ids->type == GGML_TYPE_I32 && ggml_is_contiguous(ids));
+    GGML_ASSERT(ids->ne[1] == ggml_nrows(logits) && ids->ne[0] <= 32);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, ids->ne[0], ids->ne[1]);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_ROUTE_W);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_f32(result, 2, scale);
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = logits;
+    result->src[1] = ids;
+    return result;
+}
+
 // ggml_turbo_wht
 
 struct ggml_tensor * ggml_turbo_wht(

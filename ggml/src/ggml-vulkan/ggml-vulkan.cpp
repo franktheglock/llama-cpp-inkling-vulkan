@@ -1107,7 +1107,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_inkling_relmask[2][2]; // [mask f16][dst f16]
     vk_pipeline pipeline_inkling_relbias[2][2];
     vk_pipeline pipeline_inkling_ctrl_down, pipeline_inkling_ctrl_gate, pipeline_inkling_conv_state, pipeline_inkling_moe_sum;
-    vk_pipeline pipeline_inkling_mix_part, pipeline_inkling_mix_apply;
+    vk_pipeline pipeline_inkling_mix_part, pipeline_inkling_mix_apply, pipeline_inkling_route_ids, pipeline_inkling_route_w;
     vk_pipeline pipeline_lfm2_gateup[2][2]; // [gate is q5_K][up is q5_K]
     vk_pipeline pipeline_lfm2_down[2];      // [down is q5_K]
     uint32_t lfm2_fusion_mask {};           // bit per lfm2_fuse_kind, 0 = disabled
@@ -2286,7 +2286,7 @@ class vk_perf_logger {
             return fusion_str + name;
         }
         if (node->op == GGML_OP_INKLING) {
-            static const char * modes[] = {"CLIP", "MIX", "CONV", "GATE", "RELMASK", "SITU", "RELBIAS", "CTRL_DOWN", "CTRL_GATE", "CONV_STATE", "MOE_SUM", "MIX_PART", "MIX_APPLY"};
+            static const char * modes[] = {"CLIP", "MIX", "CONV", "GATE", "RELMASK", "SITU", "RELBIAS", "CTRL_DOWN", "CTRL_GATE", "CONV_STATE", "MOE_SUM", "MIX_PART", "MIX_APPLY", "ROUTE_IDS", "ROUTE_W"};
             std::string name = std::string("INKLING_") + modes[ggml_get_op_params_i32(node, 0)];
             name += "(" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," + std::to_string(node->ne[2]) + ")";
             if (ggml_get_op_params_i32(node, 0) == 1) name += " nb=" + std::to_string(ggml_get_op_params_i32(node, 2));
@@ -6089,6 +6089,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_inkling_mix,  "inkling_mix_f32",  inkling_mix_f32_len,  inkling_mix_f32_data,  "main", 11, 7 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
             ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_part,  "inkling_mix_part_f32",  inkling_mix_part_f32_len,  inkling_mix_part_f32_data,  "main", 11, 7 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
             ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_apply, "inkling_mix_apply_f32", inkling_mix_apply_f32_len, inkling_mix_apply_f32_data, "main", 11, 7 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
+            ggml_vk_create_pipeline(device, device->pipeline_inkling_route_ids, "inkling_route_ids_f32", inkling_route_ids_f32_len, inkling_route_ids_f32_data, "main", 3, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_inkling_route_w, "inkling_route_w_f32", inkling_route_w_f32_len, inkling_route_w_f32_data, "main", 3, 5 * sizeof(uint32_t), {1, 1, 1}, {sg}, 1, true, true);
             ggml_vk_create_pipeline(device, device->pipeline_inkling_conv, "inkling_conv_f32", inkling_conv_f32_len, inkling_conv_f32_data, "main", 4, 8 * sizeof(uint32_t), {256, 1, 1}, {}, 1);
             ggml_vk_create_pipeline(device, device->pipeline_inkling_ctrl_down, "inkling_ctrl_down_f32", inkling_ctrl_down_f32_len, inkling_ctrl_down_f32_data, "main", 4, 4 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true);
             ggml_vk_create_pipeline(device, device->pipeline_inkling_ctrl_gate, "inkling_ctrl_gate_f32", inkling_ctrl_gate_f32_len, inkling_ctrl_gate_f32_data, "main", 6, 3 * sizeof(uint32_t), {1, 1, 1}, {}, 1, true, true, sg);
@@ -13583,6 +13585,24 @@ static void ggml_vk_inkling(ggml_backend_vk_context * ctx, vk_context& subctx, g
             ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
             ggml_vk_dispatch_pipeline(ctx, subctx, pl, { sb(s0), sb(c), sb(b[0]), sb(b[1]), sb(b[2]), sb(b[3]), sb(b[4]), sb(b[5]), sb(b[6]), sb(b[7]), d_buf },
                 pc, { n_chunks, T, 1 });
+        } break;
+        case GGML_INKLING_ROUTE_IDS: {
+            const ggml_tensor * lg = dst->src[0];
+            const uint32_t T = (uint32_t) dst->ne[1];
+            struct { uint32_t n_exp, k, T; } pc = { (uint32_t) lg->ne[0], (uint32_t) dst->ne[0], T };
+            vk_pipeline pl = ctx->device->pipeline_inkling_route_ids;
+            ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pl, { sb(lg), sb(dst->src[1]), d_buf }, pc, { std::min(T, 65535u), CEIL_DIV(T, 65535u), 1 });
+        } break;
+        case GGML_INKLING_ROUTE_W: {
+            const ggml_tensor * lg  = dst->src[0];
+            const ggml_tensor * ids = dst->src[1];
+            GGML_ASSERT((uint32_t) ids->ne[0] <= ctx->device->subgroup_size);
+            const uint32_t T = (uint32_t) ids->ne[1];
+            struct { uint32_t n_exp, k, T; float eps, scale; } pc = { (uint32_t) lg->ne[0], (uint32_t) ids->ne[0], T, ggml_get_op_params_f32(dst, 1), ggml_get_op_params_f32(dst, 2) };
+            vk_pipeline pl = ctx->device->pipeline_inkling_route_w;
+            ggml_pipeline_request_descriptor_sets(ctx, pl, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pl, { sb(lg), sb(ids), d_buf }, pc, { std::min(T, 65535u), CEIL_DIV(T, 65535u), 1 });
         } break;
         case GGML_INKLING_MOE_SUM: {
             const ggml_tensor * y = dst->src[0];

@@ -2651,6 +2651,8 @@ extern "C" {
         GGML_INKLING_CTRL_GATE = 8, // (1 - tanh(F h))*cur + tanh(G h)*msg
         GGML_INKLING_MIX_PART  = 11, // per 256-element chunk: sum of squares and query dots of every state -> [45, n_chunks, T]
         GGML_INKLING_MIX_APPLY = 12, // softmax weights from the partials, weighted sum of the normalized states
+        GGML_INKLING_ROUTE_IDS = 13, // top-k of sigmoid(logits) + bias (descending, ties to the lower index) -> i32 ids
+        GGML_INKLING_ROUTE_W   = 14, // p = sigmoid(logits[ids]); w = p/(sum(p) + eps)*scale
         GGML_INKLING_MOE_SUM  = 10, // out[:, t] = sum_e w[e, t]*scale[ids[e, t]]*y[:, e, t]
         GGML_INKLING_CONV_STATE = 9, // CONV reading the history and the input directly, writing the new conv state
         GGML_INKLING_SITU    = 5, // MoE SITU on a merged [gate | up] row: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
@@ -2765,6 +2767,21 @@ extern "C" {
             struct ggml_tensor ** blocks,
             int                   n_blocks,
             float                 eps);
+
+    // logits: [n_expert, T] f32; bias: [n_expert] f32 -> [k, T] i32
+    GGML_API struct ggml_tensor * ggml_inkling_route_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * bias,
+            int                   k);
+
+    // logits: [n_expert, T] f32; ids: [k, T] i32 -> [1, k, T] f32
+    GGML_API struct ggml_tensor * ggml_inkling_route_w(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * ids,
+            float                 eps,
+            float                 scale);
 
     // y: [n, n_used, T] f32 contiguous; w: [1, n_used, T] f32; ids: [n_used, T] i32 or NULL; scale: [n_expert] f32 or NULL
     GGML_API struct ggml_tensor * ggml_inkling_moe_sum(

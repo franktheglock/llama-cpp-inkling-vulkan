@@ -11747,6 +11747,39 @@ static void ggml_inkling_mix_apply_f32(const ggml_compute_params * params, ggml_
     }
 }
 
+static void ggml_inkling_route_ids_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * lg = dst->src[0];
+    const ggml_tensor * bs = dst->src[1];
+    const int64_t n_exp = lg->ne[0], k = dst->ne[0], T = dst->ne[1];
+    std::vector<float> v(n_exp);
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        const float * l = (const float *) lg->data + t*n_exp;
+        for (int64_t i = 0; i < n_exp; ++i) v[i] = 1.0f/(1.0f + expf(-l[i])) + ((const float *) bs->data)[i];
+        int32_t * ids = (int32_t *) dst->data + t*k;
+        for (int64_t i = 0; i < n_exp; ++i) {
+            int64_t rank = 0;
+            for (int64_t j = 0; j < n_exp; ++j) rank += (v[j] > v[i]) || (v[j] == v[i] && j < i);
+            if (rank < k) ids[rank] = (int32_t) i;
+        }
+    }
+}
+
+static void ggml_inkling_route_w_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * lg  = dst->src[0];
+    const ggml_tensor * ids = dst->src[1];
+    const float eps = ggml_get_op_params_f32(dst, 1), scale = ggml_get_op_params_f32(dst, 2);
+    const int64_t n_exp = lg->ne[0], k = ids->ne[0], T = ids->ne[1];
+    for (int64_t t = params->ith; t < T; t += params->nth) {
+        float p[32], sum = 0.0f;
+        for (int64_t e = 0; e < k; ++e) {
+            const int32_t id = ((const int32_t *) ids->data)[t*k + e];
+            p[e] = 1.0f/(1.0f + expf(-((const float *) lg->data)[t*n_exp + id]));
+            sum += p[e];
+        }
+        for (int64_t e = 0; e < k; ++e) ((float *) dst->data)[t*k + e] = p[e]/(sum + eps)*scale;
+    }
+}
+
 void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tensor * dst) {
     switch ((enum ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
         case GGML_INKLING_CLIP:    ggml_inkling_clip_f32   (params, dst); break;
@@ -11760,6 +11793,8 @@ void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tenso
         case GGML_INKLING_CTRL_GATE: ggml_inkling_ctrl_gate_f32(params, dst); break;
         case GGML_INKLING_CONV_STATE: ggml_inkling_conv_state_f32(params, dst); break;
         case GGML_INKLING_MOE_SUM: ggml_inkling_moe_sum_f32(params, dst); break;
+        case GGML_INKLING_ROUTE_IDS: ggml_inkling_route_ids_f32(params, dst); break;
+        case GGML_INKLING_ROUTE_W:   ggml_inkling_route_w_f32  (params, dst); break;
         case GGML_INKLING_MIX_PART:  ggml_inkling_mix_part_f32 (params, dst); break;
         case GGML_INKLING_MIX_APPLY: ggml_inkling_mix_apply_f32(params, dst); break;
         default: GGML_ABORT("unknown inkling op");
