@@ -1942,8 +1942,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     return 0;
 }
 
-static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubatch & ubatch, uint32_t row_offset) {
-    std::map<llama_seq_id, uint32_t> seq_to_row;
+static std::map<llama_seq_id, std::vector<uint32_t>> build_seq_to_output_rows(const llama_ubatch & ubatch, uint32_t row_offset) {
+    std::map<llama_seq_id, std::vector<uint32_t>> seq_to_rows;
     // how many output tokens we have seen so far for this ubatch.
     uint32_t local = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -1954,96 +1954,108 @@ static std::map<llama_seq_id, uint32_t> build_seq_to_output_row(const llama_ubat
 
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
         // row_offset is the number of output tokens before this ubatch.
-        seq_to_row[seq_id] = row_offset + local;
+        seq_to_rows[seq_id].push_back(row_offset + local);
         ++local;
     }
-    return seq_to_row;
+    return seq_to_rows;
 }
 
 static void copy_tensor_async_ints(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const std::map<llama_seq_id, std::vector<ggml_tensor *>> & tensor_map,
     const buffer_view<llama_token> & sampled,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    const std::map<llama_seq_id, std::vector<uint32_t>> & seq_to_rows,
     ggml_backend_sched_t sched) {
     if (!sampled.has_data()) {
         return;
     }
 
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
+    for (const auto & [seq_id, tensors] : tensor_map) {
+        auto it = seq_to_rows.find(seq_id);
+        if (it == seq_to_rows.end()) {
             continue;
         }
 
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < sampled.size);
+        const auto & rows = it->second;
+        GGML_ASSERT(tensors.size() == rows.size());
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const uint32_t row = rows[k];
+            ggml_tensor * tensor = tensors[k];
+            GGML_ASSERT(row < sampled.size);
+            GGML_ASSERT(ggml_is_contiguous(tensor) && "sampled tokens tensor must be contiguous for async copy");
 
-        GGML_ASSERT(ggml_is_contiguous(tensor) && "sampled tokens tensor must be contiguous for async copy");
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        ggml_backend_tensor_get_async(backend, tensor, sampled.data + row, 0, sizeof(sampled.data[row]));
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+            ggml_backend_tensor_get_async(backend, tensor, sampled.data + row, 0, sizeof(sampled.data[row]));
+        }
     }
 }
 
 static void copy_tensor_async_floats(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const std::map<llama_seq_id, std::vector<ggml_tensor *>> & tensor_map,
     const buffer_view<float> & dst,
     size_t stride,
     std::vector<uint32_t> & counts,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    const std::map<llama_seq_id, std::vector<uint32_t>> & seq_to_rows,
     ggml_backend_sched_t sched) {
     if (!dst.has_data()) {
         return;
     }
 
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
+    for (const auto & [seq_id, tensors] : tensor_map) {
+        auto it = seq_to_rows.find(seq_id);
+        if (it == seq_to_rows.end()) {
             continue;
         }
 
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < counts.size());
+        const auto & rows = it->second;
+        GGML_ASSERT(tensors.size() == rows.size());
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const uint32_t row = rows[k];
+            ggml_tensor * tensor = tensors[k];
+            GGML_ASSERT(row < counts.size());
+            GGML_ASSERT(ggml_is_contiguous(tensor) && "logits/probs tensor must be contiguous for async copy");
 
-        GGML_ASSERT(ggml_is_contiguous(tensor) && "logits/probs tensor must be contiguous for async copy");
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+            float * row_ptr = dst.data + (size_t) row * stride;
+            ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        float * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
-
-        // Update the actual number of logits/probabilities that were written for this row.
-        counts[row] = ggml_nelements(tensor);
+            // Update the actual number of logits/probabilities that were written for this row.
+            counts[row] = ggml_nelements(tensor);
+        }
     }
 }
 
 static void copy_tensor_async_candidates(
-    const std::map<llama_seq_id, ggml_tensor*> & tensor_map,
+    const std::map<llama_seq_id, std::vector<ggml_tensor *>> & tensor_map,
     const buffer_view<llama_token> & dst,
     size_t stride,
     std::vector<uint32_t> & counts,
-    const std::map<llama_seq_id, uint32_t> & seq_to_row,
+    const std::map<llama_seq_id, std::vector<uint32_t>> & seq_to_rows,
     ggml_backend_sched_t sched) {
     if (!dst.has_data()) {
         return;
     }
 
-    for (const auto & [seq_id, tensor] : tensor_map) {
-        auto it = seq_to_row.find(seq_id);
-        if (it == seq_to_row.end()) {
+    for (const auto & [seq_id, tensors] : tensor_map) {
+        auto it = seq_to_rows.find(seq_id);
+        if (it == seq_to_rows.end()) {
             continue;
         }
 
-        const uint32_t row = it->second;
-        GGML_ASSERT(row < counts.size());
+        const auto & rows = it->second;
+        GGML_ASSERT(tensors.size() == rows.size());
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const uint32_t row = rows[k];
+            ggml_tensor * tensor = tensors[k];
+            GGML_ASSERT(row < counts.size());
+            GGML_ASSERT(ggml_is_contiguous(tensor) && "candidates tensor must be contiguous for async copy");
 
-        GGML_ASSERT(ggml_is_contiguous(tensor) && "candidates tensor must be contiguous for async copy");
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+            llama_token * row_ptr = dst.data + (size_t) row * stride;
+            ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
-        llama_token * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
-
-        // Update the actual number of candidates that were written.
-        counts[row] = ggml_nelements(tensor);
+            // Update the actual number of candidates that were written.
+            counts[row] = ggml_nelements(tensor);
+        }
     }
 }
 
@@ -2093,28 +2105,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
     // TODO: avoid this workaround in the future
-    if (has_samplers && batch_inp.logits) {
-        std::vector<int32_t> seq_output_count(n_seq_max, 0);
-
-        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
-            if (batch_inp.logits[i] == 0) {
-                continue;
-            }
-
-            const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
-
-            for (int32_t s = 0; s < ns; ++s) {
-                const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[i][s] : 0;
-
-                seq_output_count[seq_id]++;
-                if (seq_output_count[seq_id] > 1) {
-                    LLAMA_LOG_ERROR("%s: backend sampling requires at most one output token per sequence (seq_id %d had %d)\n",
-                            __func__, seq_id, seq_output_count[seq_id]);
-                    return -1;
-                }
-            }
-        }
-    }
+    // Multi-output backend sampling per sequence is supported (used by speculative verification).
 
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
@@ -2377,17 +2368,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (auto * t_dspark = res->get_dspark_tokens()) {
+            ggml_backend_t backend_ds = ggml_backend_sched_get_tensor_backend(sched.get(), t_dspark);
+            GGML_ASSERT(backend_ds != nullptr);
+            const size_t n_el = (size_t) ggml_nelements(t_dspark);
+            dspark_tokens.resize(n_el);
+            ggml_backend_tensor_get_async(backend_ds, t_dspark, dspark_tokens.data(), 0, n_el * sizeof(int32_t));
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
-            const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
+            const auto seq_to_output_rows = build_seq_to_output_rows(ubatch, n_outputs_prev);
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
+            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_rows, sched.get());
 
-            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
-            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
-            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_rows, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_rows, sched.get());
+            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_rows, sched.get());
         }
 
         n_outputs_prev += n_outputs;
@@ -2826,7 +2825,9 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.dspark_ctx     =*/ &dspark_ctx_embd,
+        /*.dspark_n_steps =*/ dspark_n_steps,
+        /*.res            =*/ res,
     };
 }
 
@@ -4617,4 +4618,17 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_model_is_dspark_inkling2(const struct llama_model * model) {
+    return model && model->hparams.is_dspark_inkling2;
+}
+
+void llama_set_dspark_context(struct llama_context * ctx, const float * data, size_t n_floats, int32_t n_steps) {
+    ctx->set_dspark_context(data, n_floats, n_steps);
+}
+
+const int32_t * llama_get_dspark_tokens(struct llama_context * ctx, size_t * n_out) {
+    ctx->synchronize();
+    return ctx->get_dspark_tokens(n_out);
 }

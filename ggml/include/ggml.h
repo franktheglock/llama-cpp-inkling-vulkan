@@ -2654,8 +2654,14 @@ extern "C" {
         GGML_INKLING_ROUTE_IDS = 13, // top-k of sigmoid(logits) + bias (descending, ties to the lower index) -> i32 ids
         GGML_INKLING_ROUTE_W   = 14, // p = sigmoid(logits[ids]); w = p/(sum(p) + eps)*scale
         GGML_INKLING_MOE_SUM  = 10, // out[:, t] = sum_e w[e, t]*scale[ids[e, t]]*y[:, e, t]
-        GGML_INKLING_CONV_STATE = 9, // CONV reading the history and the input directly, writing the new conv state
+        GGML_INKLING_CONV_STATE = 9, // CONV reading the history and the input directly, writing the new conv state (+ optional resid add)
         GGML_INKLING_SITU    = 5, // MoE SITU on a merged [gate | up] row: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
+        GGML_INKLING_MOE_GATEUP = 15, // fused MoE gate+up GEMV (NVFP4/Q8_0) + scale + SITU -> [n_ff, n_used, T]
+        GGML_INKLING_MOE_DOWN   = 16, // fused MoE down GEMV (NVFP4/Q8_0) + scale + weights + sum -> [n_embd, T]
+        GGML_INKLING_PROJ_BF16  = 17, // fast small-M BF16 matvec [K, M] x [K, T] -> [M, T]
+        GGML_INKLING_MUL_SIG    = 18, // fused a * sigmoid(b)
+        GGML_INKLING_MIX_NORM   = 19, // fused single-query depth mix + RMSNorm * norm_w
+        GGML_INKLING_KV_STORE   = 20, // fused K/V conv + state update + K-clip/V-norm + Q8_0 KV store
     };
 
     // x: [d, rows_per_token, T] f32 contiguous; scale: [d] or [d, rows_per_token] or NULL; tau: [T] or NULL
@@ -2782,6 +2788,74 @@ extern "C" {
             struct ggml_tensor  * ids,
             float                 eps,
             float                 scale);
+
+    // same as ggml_inkling_conv_state with optional residual tensor added to output
+    GGML_API struct ggml_tensor * ggml_inkling_conv_state_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * dynamic,
+            struct ggml_tensor  * state_dst,
+            struct ggml_tensor  * resid,
+            float                 out_scale);
+
+    // fused MoE gate+up GEMV + expert scale + SITU (NVFP4 / Q8_0)
+    GGML_API struct ggml_tensor * ggml_inkling_moe_gateup(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate_up_exps,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * scale,
+            float                 beta,
+            float                 linear_beta);
+
+    // fused MoE down GEMV + expert scale + routing weights + sum (NVFP4 / Q8_0)
+    GGML_API struct ggml_tensor * ggml_inkling_moe_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * down_exps,
+            struct ggml_tensor  * act,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * scale);
+
+    // fast small-M BF16 matvec
+    GGML_API struct ggml_tensor * ggml_inkling_proj_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * x);
+
+    // fused a * sigmoid(b)
+    GGML_API struct ggml_tensor * ggml_inkling_mul_sig(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // fused single-query depth mix + RMSNorm * norm_w (n_blocks <= 7, n_embd % 4 == 0, n_embd <= 4096)
+    GGML_API struct ggml_tensor * ggml_inkling_mix_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * norm_w,
+            struct ggml_tensor ** blocks,
+            int                   n_blocks,
+            float                 mix_eps,
+            float                 norm_eps);
+
+    // fused K/V short-conv + conv-state update (with n_rs_seq rollback slots) + K-clip (mode=0) or V-RMSNorm (mode=1) + Q8_0 KV store
+    GGML_API struct ggml_tensor * ggml_inkling_kv_store(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_dst,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * dynamic,
+            struct ggml_tensor  * state_dst,
+            struct ggml_tensor  * idxs,
+            int                   hd,
+            float                 out_scale,
+            int                   mode,
+            float                 param);
 
     // y: [n, n_used, T] f32 contiguous; w: [1, n_used, T] f32; ids: [n_used, T] i32 or NULL; scale: [n_expert] f32 or NULL
     GGML_API struct ggml_tensor * ggml_inkling_moe_sum(

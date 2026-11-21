@@ -2135,8 +2135,8 @@ private:
 
             backend_sampling &= task.params.sampling.backend_sampling;
 
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate());
+            // grammar and reasoning-budget samplers are CPU-only
+            backend_sampling &= common_sampler_can_use_backend(slot.smpl.get());
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_pre_sample_logits;

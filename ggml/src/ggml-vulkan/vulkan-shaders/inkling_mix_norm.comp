@@ -1,0 +1,139 @@
+#version 450
+
+// Fused single-query Inkling 2 depth mix + RMSNorm * norm_w in ONE single pass using vec4 loads:
+// Replaces INKLING_MIX_PART + INKLING_MIX_APPLY + RMS_NORM_MUL (3 dispatches -> 1 dispatch).
+// Supports n_blocks <= 7, n_embd % 4 == 0, n_embd <= 4096 (up to 4 vec4s per thread at WG=256).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameter {
+    uint n_embd; uint T; uint n_blocks; float mix_eps; float norm_eps;
+} p;
+
+layout (binding = 0)  readonly  buffer Q   {vec4 data_q[];};
+layout (binding = 1)  readonly  buffer C   {vec4 data_c[];};
+layout (binding = 2)  readonly  buffer W   {vec4 data_w[];};
+layout (binding = 3)  readonly  buffer B0  {vec4 data_b0[];};
+layout (binding = 4)  readonly  buffer B1  {vec4 data_b1[];};
+layout (binding = 5)  readonly  buffer B2  {vec4 data_b2[];};
+layout (binding = 6)  readonly  buffer B3  {vec4 data_b3[];};
+layout (binding = 7)  readonly  buffer B4  {vec4 data_b4[];};
+layout (binding = 8)  readonly  buffer B5  {vec4 data_b5[];};
+layout (binding = 9)  readonly  buffer B6  {vec4 data_b6[];};
+layout (binding = 10) writeonly buffer D   {vec4 data_d[];};
+
+#define WG 256
+layout (local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+vec4 st4(uint s, uint idx) {
+    if (s == p.n_blocks) { return data_c[idx]; }
+    if (s == 0u) { return data_b0[idx]; }
+    if (s == 1u) { return data_b1[idx]; }
+    if (s == 2u) { return data_b2[idx]; }
+    if (s == 3u) { return data_b3[idx]; }
+    if (s == 4u) { return data_b4[idx]; }
+    if (s == 5u) { return data_b5[idx]; }
+    return data_b6[idx];
+}
+
+shared vec2  red[16][8]; // [subgroup][state]: (ss, dq)
+shared float wsh[8];
+shared float yred[16];
+shared float yscale_sh;
+
+void main() {
+    const uint t = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+    if (t >= p.T) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n4 = p.n_embd >> 2u;
+    const uint n_st = p.n_blocks + 1u;
+    const uint tb4 = t * n4;
+
+    vec4 qv[4];
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        const uint i = tid + k * WG;
+        qv[k] = (i < n4) ? data_q[i] : vec4(0.0);
+    }
+
+    for (uint s = 0u; s < n_st; ++s) {
+        vec2 acc = vec2(0.0);
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            const uint i = tid + k * WG;
+            if (i < n4) {
+                const vec4 v = st4(s, tb4 + i);
+                acc.x += dot(v, v);
+                acc.y += dot(v, qv[k]);
+            }
+        }
+        acc = subgroupAdd(acc);
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID][s] = acc;
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        const float kscale = inversesqrt(float(p.n_embd));
+        float rinv[8];
+        float w[8];
+        float mx = -1.0 / 0.0;
+        for (uint s = 0u; s < n_st; ++s) {
+            vec2 a = vec2(0.0);
+            for (uint g = 0u; g < gl_NumSubgroups; ++g) {
+                a += red[g][s];
+            }
+            rinv[s] = inversesqrt(a.x / float(p.n_embd) + p.mix_eps);
+            w[s] = a.y * rinv[s] * kscale;
+            mx = max(mx, w[s]);
+        }
+        float sum = 0.0;
+        for (uint s = 0u; s < n_st; ++s) {
+            w[s] = exp(w[s] - mx);
+            sum += w[s];
+        }
+        for (uint s = 0u; s < n_st; ++s) {
+            wsh[s] = w[s] / sum * rinv[s];
+        }
+    }
+    barrier();
+
+    vec4 y[4];
+    float y_ss = 0.0;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        const uint i = tid + k * WG;
+        vec4 acc = vec4(0.0);
+        if (i < n4) {
+            for (uint s = 0u; s < n_st; ++s) {
+                acc = fma(vec4(wsh[s]), st4(s, tb4 + i), acc);
+            }
+            y_ss += dot(acc, acc);
+        }
+        y[k] = acc;
+    }
+
+    y_ss = subgroupAdd(y_ss);
+    if (gl_SubgroupInvocationID == 0u) {
+        yred[gl_SubgroupID] = y_ss;
+    }
+    barrier();
+    if (tid == 0u) {
+        float tot = 0.0;
+        for (uint g = 0u; g < gl_NumSubgroups; ++g) {
+            tot += yred[g];
+        }
+        yscale_sh = inversesqrt(tot / float(p.n_embd) + p.norm_eps);
+    }
+    barrier();
+
+    const float ys = yscale_sh;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        const uint i = tid + k * WG;
+        if (i < n4) {
+            data_d[tb4 + i] = y[k] * data_w[i] * ys;
+        }
+    }
+}

@@ -502,6 +502,7 @@ struct llama_hparams {
     // DFlash draft model
     uint32_t dflash_block_size              = 16;
     uint32_t dflash_mask_token_id           = 0;
+    bool     is_dspark_inkling2             = false;
 
 
 

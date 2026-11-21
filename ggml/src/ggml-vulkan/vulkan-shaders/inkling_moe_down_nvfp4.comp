@@ -1,0 +1,170 @@
+#version 450
+
+// Fused Inkling 2 MoE down projection + per-expert scale + routing weights + expert sum for NVFP4 weights.
+// 128-thread (4-warp on wave32) workgroup sharing 1-shot-initialized e2m1_lut[16] + ue4m3_fp32_lut[128].
+// Flattens (expert, block) across n_used * (K/64) blocks (e.g. 8*18=144 % 8 == 0 -> 0% idle tail lanes).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define DATA_A_NVFP4
+#include "types.glsl"
+
+layout (push_constant) uniform parameter {
+    uint ncols;             // K = n_ff, multiple of 64
+    uint nrows;             // M = n_embd
+    uint blocks_per_expert; // (K/64) * M
+    uint n_used;
+    uint T;
+    uint ids_nb1;
+    uint has_scale;
+} p;
+
+layout (binding = 0) readonly  buffer A32 {block_nvfp4_packed32 data_a32[];};
+layout (binding = 1) readonly  buffer X4  {vec4  data_x4[];};
+layout (binding = 2) readonly  buffer IDS {int   data_ids[];};
+layout (binding = 3) readonly  buffer W   {float data_w[];};
+layout (binding = 4) readonly  buffer SC  {float data_sc[];};
+layout (binding = 5) writeonly buffer D   {float data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 128;
+layout (constant_id = 1) const uint NUM_ROWS = 2;
+
+layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+shared float e2m1_lut[16];
+shared uint  sh_exp[16];
+shared float sh_we[16];
+
+float nvfp4_sub_dot(const uint ib, const uint sub, const vec4 x0, const vec4 x1, const vec4 x2, const vec4 x3) {
+    const uint d_all = data_a32[ib].d[0];
+    const float d = ue4m3_fp32_lut[bitfieldExtract(d_all, int(sub * 8u), 8) & 127u];
+    const uint w0 = data_a32[ib].qs[sub * 2u];
+    const uint w1 = data_a32[ib].qs[sub * 2u + 1u];
+
+    const uvec4 lo0 = unpack8(w0 & 0x0F0F0F0Fu);
+    const uvec4 hi0 = unpack8((w0 >> 4u) & 0x0F0F0F0Fu);
+    const uvec4 lo1 = unpack8(w1 & 0x0F0F0F0Fu);
+    const uvec4 hi1 = unpack8((w1 >> 4u) & 0x0F0F0F0Fu);
+
+    const float s =
+        dot(x0, vec4(e2m1_lut[lo0.x], e2m1_lut[lo0.y], e2m1_lut[lo0.z], e2m1_lut[lo0.w])) +
+        dot(x1, vec4(e2m1_lut[lo1.x], e2m1_lut[lo1.y], e2m1_lut[lo1.z], e2m1_lut[lo1.w])) +
+        dot(x2, vec4(e2m1_lut[hi0.x], e2m1_lut[hi0.y], e2m1_lut[hi0.z], e2m1_lut[hi0.w])) +
+        dot(x3, vec4(e2m1_lut[hi1.x], e2m1_lut[hi1.y], e2m1_lut[hi1.z], e2m1_lut[hi1.w]));
+    return s * d;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.z;
+
+    if (tid < 16u) {
+        e2m1_lut[tid] = float(kvalues_mxfp4_const[tid]) * 0.5;
+    }
+    if (tid < 128u) {
+        ue4m3_fp32_lut[tid] = ue4m3_to_fp32_build(tid);
+    }
+    if (tid < p.n_used && tid < 16u) {
+        const uint ex = uint(data_ids[t * p.ids_nb1 + tid]);
+        float we = data_w[t * p.n_used + tid];
+        if (p.has_scale != 0u) {
+            we *= data_sc[ex];
+        }
+        sh_exp[tid] = ex;
+        sh_we[tid]  = we;
+    }
+    barrier();
+
+    const uint first_row = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NUM_ROWS;
+    if (first_row >= p.nrows) {
+        return;
+    }
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint nb = p.ncols >> 6; // K / 64
+    const uint sub = lane & 3u;
+    const uint blk_lane = lane >> 2u;
+    const uint blk_stride = gl_SubgroupSize >> 2u;
+    const uint k4 = p.ncols >> 2u;
+
+    float acc[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        acc[n] = 0.0;
+    }
+
+    if (p.n_used <= 16u && nb > 0u) {
+        const uint total_b = p.n_used * nb;
+        uint e = blk_lane / nb;
+        uint b = blk_lane - e * nb;
+        for (uint eb = blk_lane; eb < total_b; eb += blk_stride) {
+            const uint expert = sh_exp[e];
+            const float we = sh_we[e];
+            const uint xb4 = (t * p.n_used + e) * k4 + b * 16u + sub * 4u;
+            const vec4 x0 = data_x4[xb4];
+            const vec4 x1 = data_x4[xb4 + 1u];
+            const vec4 x2 = data_x4[xb4 + 2u];
+            const vec4 x3 = data_x4[xb4 + 3u];
+            const uint exp_base = expert * p.blocks_per_expert + b;
+
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint row = min(first_row + n, p.nrows - 1u);
+                acc[n] = fma(we, nvfp4_sub_dot(exp_base + row * nb, sub, x0, x1, x2, x3), acc[n]);
+            }
+
+            b += blk_stride;
+            while (b >= nb) {
+                b -= nb;
+                e++;
+            }
+        }
+    } else {
+        for (uint e = 0u; e < p.n_used; ++e) {
+            const uint expert = uint(data_ids[t * p.ids_nb1 + e]);
+            float we = data_w[t * p.n_used + e];
+            if (p.has_scale != 0u) {
+                we *= data_sc[expert];
+            }
+            const uint x_base4 = (t * p.n_used + e) * k4;
+            const uint exp_base = expert * p.blocks_per_expert;
+
+            float te[NUM_ROWS];
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                te[n] = 0.0;
+            }
+            for (uint b = blk_lane; b < nb; b += blk_stride) {
+                const uint xb4 = x_base4 + b * 16u + sub * 4u;
+                const vec4 x0 = data_x4[xb4];
+                const vec4 x1 = data_x4[xb4 + 1u];
+                const vec4 x2 = data_x4[xb4 + 2u];
+                const vec4 x3 = data_x4[xb4 + 3u];
+
+                [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                    const uint row = min(first_row + n, p.nrows - 1u);
+                    te[n] += nvfp4_sub_dot(exp_base + row * nb + b, sub, x0, x1, x2, x3);
+                }
+            }
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                acc[n] = fma(we, te[n], acc[n]);
+            }
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        acc[n] = subgroupAdd(acc[n]);
+    }
+
+    if (lane == 0u) {
+        const uint out_base = t * p.nrows;
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint row = first_row + n;
+            if (row < p.nrows) {
+                data_d[out_base + row] = acc[n];
+            }
+        }
+    }
+}

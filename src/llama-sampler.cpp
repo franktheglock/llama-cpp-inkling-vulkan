@@ -1031,7 +1031,8 @@ struct llama_sampler_dist : public llama_sampler_backend {
 
     std::mt19937 rng;
 
-    ggml_tensor * inp_uniform;
+    const ggml_context * last_ctx = nullptr;
+    std::vector<ggml_tensor *> inp_uniforms;
 };
 
 static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
@@ -1156,9 +1157,14 @@ static void llama_sampler_dist_backend_apply(
 
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    sctx->inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_set_name (sctx->inp_uniform, "uniform");
-    ggml_set_input(sctx->inp_uniform);
+    if (sctx->last_ctx != ctx) {
+        sctx->inp_uniforms.clear();
+        sctx->last_ctx = ctx;
+    }
+    struct ggml_tensor * inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name (inp_uniform, "uniform");
+    ggml_set_input(inp_uniform);
+    sctx->inp_uniforms.push_back(inp_uniform);
 
     // flatten
     struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
@@ -1174,7 +1180,7 @@ static void llama_sampler_dist_backend_apply(
     // Recall that each entry in cumsum is the cumulative probability up to that
     // index so values stay negative while the cumulative total is below the
     // random value, and become zero/positive once the threshold is crossed.
-    struct ggml_tensor * diff = ggml_sub(ctx, cumsum, sctx->inp_uniform);
+    struct ggml_tensor * diff = ggml_sub(ctx, cumsum, inp_uniform);
     ggml_set_name(diff, "dist_cumsum");
 
     // The ggml_step function produces a tensor where entries are 1 if the
@@ -1210,7 +1216,7 @@ static void llama_sampler_dist_backend_apply(
 static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
-    GGML_ASSERT(sctx->inp_uniform != nullptr);
+    GGML_ASSERT(!sctx->inp_uniforms.empty());
 
     // We sample in double precision and cast to float to match rnd numbers of
     // llama_dampler_dist which uses double precision (sampling from
@@ -1218,9 +1224,10 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     // std::uniform_real_distribution<float> with same rng will produce
     // different sequences).
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const float rnd = dist(sctx->rng);
-
-    ggml_backend_tensor_set(sctx->inp_uniform, &rnd, 0, sizeof(float));
+    for (auto * inp_uniform : sctx->inp_uniforms) {
+        const float rnd = dist(sctx->rng);
+        ggml_backend_tensor_set(inp_uniform, &rnd, 0, sizeof(float));
+    }
 }
 
 static struct llama_sampler_i llama_sampler_dist_i = {
@@ -1245,7 +1252,8 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .seed        = */ seed,
             /* .seed_cur    = */ seed_cur,
             /* .rng         = */ std::mt19937(seed_cur),
-            /* .inp_uniform = */ nullptr,
+            /* .last_ctx    = */ nullptr,
+            /* .inp_uniforms = */ {},
         }
     );
 }
@@ -2651,8 +2659,9 @@ struct llama_sampler_penalties : public llama_sampler_backend {
     std::unordered_map<llama_token, int> token_count;
 
     // backend graph inputs
-    ggml_tensor * inp_token_ids = nullptr;
-    ggml_tensor * inp_counts    = nullptr;
+    const ggml_context * last_ctx      = nullptr;
+    ggml_tensor        * inp_token_ids = nullptr;
+    ggml_tensor        * inp_counts    = nullptr;
 
     // backend helpers
     int32_t n_max   = 0;
@@ -2838,13 +2847,16 @@ static void llama_sampler_penalties_backend_apply(
     sctx->has_candidates = data->candidates != nullptr;
     sctx->n_max   = std::min(sctx->penalty_last_n, sctx->n_vocab);
 
-    sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
-    ggml_set_input(sctx->inp_token_ids);
+    if (sctx->last_ctx != ctx) {
+        sctx->last_ctx = ctx;
+        sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
+        ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
+        ggml_set_input(sctx->inp_token_ids);
 
-    sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_counts, "penalties_counts");
-    ggml_set_input(sctx->inp_counts);
+        sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
+        ggml_set_name(sctx->inp_counts, "penalties_counts");
+        ggml_set_input(sctx->inp_counts);
+    }
 
     if ((int32_t) sctx->host_token_ids.size() != sctx->n_max) {
         sctx->host_token_ids.assign(sctx->n_max, 0);
@@ -3669,8 +3681,9 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
 
     std::vector<llama_logit_bias> to_search;
 
-    struct ggml_tensor * inp_logit_bias;
-    struct ggml_tensor * inp_logit_idxs;
+    const ggml_context * last_ctx = nullptr;
+    struct ggml_tensor * inp_logit_bias = nullptr;
+    struct ggml_tensor * inp_logit_idxs = nullptr;
 };
 
 static const char * llama_sampler_logit_bias_name(const struct llama_sampler * smpl) {
@@ -3735,13 +3748,16 @@ static void llama_sampler_logit_bias_backend_apply(
 
     const size_t n = sctx->logit_bias.size();
 
-    sctx->inp_logit_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
-    ggml_set_name(sctx->inp_logit_bias, "logit_bias");
-    ggml_set_input(sctx->inp_logit_bias);
+    if (sctx->last_ctx != ctx) {
+        sctx->last_ctx = ctx;
+        sctx->inp_logit_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n);
+        ggml_set_name(sctx->inp_logit_bias, "logit_bias");
+        ggml_set_input(sctx->inp_logit_bias);
 
-    sctx->inp_logit_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
-    ggml_set_name(sctx->inp_logit_idxs, "logit_idxs");
-    ggml_set_input(sctx->inp_logit_idxs);
+        sctx->inp_logit_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+        ggml_set_name(sctx->inp_logit_idxs, "logit_idxs");
+        ggml_set_input(sctx->inp_logit_idxs);
+    }
 
     ggml_tensor * cur = ggml_fill(ctx, data->logits, 0.0f);
 
@@ -3822,6 +3838,7 @@ struct llama_sampler * llama_sampler_init_logit_bias(
             /* .n_vocab        = */ n_vocab,
             /* .logit_bias     = */ std::vector<llama_logit_bias>(logit_bias, logit_bias + n_logit_bias),
             /* .to_search      = */ {},
+            /* .last_ctx       = */ nullptr,
             /* .inp_logit_bias = */ nullptr,
             /* .inp_logit_idxs = */ nullptr,
         }

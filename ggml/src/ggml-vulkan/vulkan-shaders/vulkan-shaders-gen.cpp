@@ -1309,6 +1309,14 @@ void process_shaders() {
     string_to_spv("inkling_conv_state_f32", "inkling_conv_state.comp", {});
     string_to_spv("inkling_ctrl_down_f32", "inkling_ctrl_down.comp", {});
     string_to_spv("inkling_ctrl_gate_f32", "inkling_ctrl_gate.comp", {});
+    string_to_spv("inkling_moe_gateup_nvfp4", "inkling_moe_gateup_nvfp4.comp", {});
+    string_to_spv("inkling_moe_down_nvfp4",   "inkling_moe_down_nvfp4.comp",   {});
+    string_to_spv("inkling_moe_gateup_q8_0",  "inkling_moe_gateup_q8_0.comp",  {});
+    string_to_spv("inkling_moe_down_q8_0",    "inkling_moe_down_q8_0.comp",    {});
+    string_to_spv("inkling_proj_bf16_f32",    "inkling_proj_bf16.comp",        {});
+    string_to_spv("inkling_mul_sig_f32",      "inkling_mul_sig.comp",          {});
+    string_to_spv("inkling_mix_norm_f32",     "inkling_mix_norm.comp",         {});
+    string_to_spv("inkling_kv_store_q8_0",    "inkling_kv_store_q8_0.comp",    {});
     string_to_spv("inkling_relbias_f16_f16", "inkling_relbias.comp", {{"MASK_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
     string_to_spv("inkling_relbias_f16_f32", "inkling_relbias.comp", {{"MASK_TYPE", "float16_t"}, {"D_TYPE", "float"}});
     string_to_spv("inkling_relbias_f32_f16", "inkling_relbias.comp", {{"MASK_TYPE", "float"},     {"D_TYPE", "float16_t"}});

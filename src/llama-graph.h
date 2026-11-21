@@ -172,6 +172,19 @@ public:
     const int64_t n_embd = 0;
 };
 
+class llm_graph_input_dspark_ctx : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_ctx(const std::vector<float> * src, int64_t n_embd) : src(src), n_embd(n_embd) {}
+    virtual ~llm_graph_input_dspark_ctx() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * ctx_tensor = nullptr; // F32 [n_embd, nb]
+    const std::vector<float> * src = nullptr;
+    const int64_t n_embd = 0;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -510,6 +523,8 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    bool block_uniform_swa = false;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -775,14 +790,17 @@ public:
 
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
-    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
-        samplers(std::move(samplers)) { }
+    llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers,
+                             std::map<llama_seq_id, std::vector<int32_t>> seq_to_logit_rows) :
+        samplers(std::move(samplers)),
+        seq_to_logit_rows(std::move(seq_to_logit_rows)) { }
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    std::map<llama_seq_id, std::vector<int32_t>> seq_to_logit_rows;
 };
 
 struct llm_graph_fused_node {
@@ -838,6 +856,9 @@ struct llm_graph_params {
 
     llm_graph_cb cb;
 
+    const std::vector<float> * dspark_ctx = nullptr;
+    int32_t dspark_n_steps = 0;
+
     llm_graph_result * res;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
@@ -875,6 +896,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (dspark_n_steps != other.dspark_n_steps) {
             return false;
         }
 
@@ -925,8 +950,9 @@ public:
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
-    ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
-    ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_embd_pooled()   const { return t_embd_pooled; }
+    ggml_tensor * get_h_nextn()       const { return t_h_nextn; }
+    ggml_tensor * get_dspark_tokens() const { return t_dspark_tokens; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -963,15 +989,16 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_h_nextn       = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_dspark_tokens = nullptr; // [block_size - 1, nb] GPU-sampled DSpark draft token IDs
 
     std::vector<ggml_tensor *> t_layer_inp;
 
-    std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
-    std::map<llama_seq_id, ggml_tensor *> t_candidates;
-    std::map<llama_seq_id, ggml_tensor *> t_sampled;
+    std::map<llama_seq_id, std::vector<ggml_tensor *>> t_sampled_logits;
+    std::map<llama_seq_id, std::vector<ggml_tensor *>> t_candidates;
+    std::map<llama_seq_id, std::vector<ggml_tensor *>> t_sampled;
     std::vector<llm_graph_fused_node> fused_nodes;
-    std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
+    std::map<llama_seq_id, std::vector<ggml_tensor *>> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -1069,6 +1096,9 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+
+    const std::vector<float> * dspark_ctx = nullptr;
+    int32_t dspark_n_steps = 0;
 
     llm_graph_result * res;
 

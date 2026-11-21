@@ -146,6 +146,10 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+LLAMA_API bool llama_model_is_dspark_inkling2(const struct llama_model * model);
+LLAMA_API void llama_set_dspark_context(struct llama_context * ctx, const float * data, size_t n_floats, int32_t n_steps);
+LLAMA_API const int32_t * llama_get_dspark_tokens(struct llama_context * ctx, size_t * n_out);
+
 //
 // model/context data extraction
 //

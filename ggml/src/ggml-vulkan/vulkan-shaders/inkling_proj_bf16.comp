@@ -1,0 +1,57 @@
+#version 450
+
+// Fast small-M BF16 matvec for Inkling 2 (attn_sink_proj m=24, attn_conv_proj m=32):
+// One 256-thread workgroup (8 subgroups on wave32) per (row, t) with vectorized uvec2/vec4 loads.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameter { uint k; uint m; uint T; } p;
+
+layout (binding = 0) readonly  buffer W2 {uvec2 data_w2[];};
+layout (binding = 1) readonly  buffer X4 {vec4  data_x4[];};
+layout (binding = 2) writeonly buffer D  {float data_d[];};
+
+#define WG 256
+layout (local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+shared float red[32];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.m || t >= p.T) {
+        return;
+    }
+
+    const uint k4 = p.k >> 2u;
+    const uint wb = row * k4;
+    const uint xb = t * k4;
+
+    float acc = 0.0;
+    for (uint i = tid; i < k4; i += WG) {
+        const uvec2 w2 = data_w2[wb + i];
+        const vec4 wv = vec4(
+            uintBitsToFloat((w2.x & 0xFFFFu) << 16u),
+            uintBitsToFloat(w2.x & 0xFFFF0000u),
+            uintBitsToFloat((w2.y & 0xFFFFu) << 16u),
+            uintBitsToFloat(w2.y & 0xFFFF0000u)
+        );
+        acc += dot(wv, data_x4[xb + i]);
+    }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) {
+        red[gl_SubgroupID] = acc;
+    }
+    barrier();
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint g = 0u; g < gl_NumSubgroups; ++g) {
+            total += red[g];
+        }
+        data_d[t * p.m + row] = total;
+    }
+}

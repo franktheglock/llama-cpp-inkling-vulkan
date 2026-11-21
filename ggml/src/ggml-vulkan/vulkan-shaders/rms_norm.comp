@@ -30,13 +30,15 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 #endif
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #define BLOCK_SIZE 512
 
 layout (constant_id = 1) const bool do_multiply = false;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
-shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+shared FLOAT_TYPE sumsh[64];
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -61,25 +63,40 @@ void rms_norm(uint num_iters) {
     uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
 #endif
     FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
+    FLOAT_TYPE rx[8];
 
-    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-        FLOAT_TYPE xi = FLOAT_TYPE(0);
-        if (col < ncols) {
-            xi = FLOAT_TYPE(data_a[a_offset + col]);
+    if (num_iters <= 8) {
+        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+            FLOAT_TYPE xi = FLOAT_TYPE(0);
+            if (col < ncols) {
+                xi = FLOAT_TYPE(data_a[a_offset + col]);
+            }
+            rx[idx] = xi;
+            sum += xi * xi;
         }
-        sum += xi * xi;
+    } else {
+        for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+            FLOAT_TYPE xi = FLOAT_TYPE(0);
+            if (col < ncols) {
+                xi = FLOAT_TYPE(data_a[a_offset + col]);
+            }
+            sum += xi * xi;
+        }
     }
 
-    sumsh[tid] = sum;
-    // sum up partial sums and write back result
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        sumsh[gl_SubgroupID] = sum;
+    }
     barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sum += sumsh[tid + s];
-            sumsh[tid] = sum;
+    if (tid == 0) {
+        FLOAT_TYPE total = FLOAT_TYPE(0.0f);
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            total += sumsh[s];
         }
-        barrier();
+        sumsh[0] = total;
     }
+    barrier();
     sum = sumsh[0];
 
     const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
@@ -87,26 +104,53 @@ void rms_norm(uint num_iters) {
 
     if (do_multiply) {
         if (ncols > p.ne10) {
-            [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-                if (col >= ncols) {
-                    continue;
+            if (num_iters <= 8) {
+                [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                    if (col >= ncols) {
+                        continue;
+                    }
+                    data_d[d_offset + col] = D_TYPE(scale * rx[idx] * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+            } else {
+                for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                    if (col >= ncols) {
+                        continue;
+                    }
+                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                }
             }
         } else {
-            [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-                if (col >= ncols) {
-                    continue;
+            if (num_iters <= 8) {
+                [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                    if (col >= ncols) {
+                        continue;
+                    }
+                    data_d[d_offset + col] = D_TYPE(scale * rx[idx] * FLOAT_TYPE(data_b[b_offset + col]));
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+            } else {
+                for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                    if (col >= ncols) {
+                        continue;
+                    }
+                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                }
             }
         }
     } else {
-        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
-            if (col >= ncols) {
-                continue;
+        if (num_iters <= 8) {
+            [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                if (col >= ncols) {
+                    continue;
+                }
+                data_d[d_offset + col] = D_TYPE(scale * rx[idx]);
             }
-            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+        } else {
+            for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
+                if (col >= ncols) {
+                    continue;
+                }
+                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            }
         }
     }
 #if RMS_NORM_ROPE_FUSION
@@ -136,8 +180,10 @@ void main() {
         rms_norm(12);
     } else if (num_blocks > 8) {
         rms_norm(10);
-    } else if (num_blocks > 4) {
+    } else if (num_blocks > 5) {
         rms_norm(8);
+    } else if (num_blocks == 5) {
+        rms_norm(5);
     } else if (num_blocks == 4) {
         rms_norm(4);
     } else if (num_blocks == 3) {

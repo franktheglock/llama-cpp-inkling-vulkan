@@ -1,7 +1,7 @@
 #version 450
 
 // Inkling 2 loop controller down projection: h[k, t] = rc*dot(D[0:n, k], cur[:, t]) + rm*dot(D[n:2n, k], msg[:, t])
-// rc, rm: rms factors of cur and msg. One 256-thread workgroup per (k, t).
+// Vectorized vec4 path when n % 4 == 0 (4x wider GDDR6 loads on 226 MB F32 controller weights).
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
@@ -9,10 +9,13 @@
 
 layout (push_constant) uniform parameter { uint n; uint rank; uint T; float eps; } p;
 
-layout (binding = 0) readonly  buffer CUR {float data_c[];};
-layout (binding = 1) readonly  buffer MSG {float data_m[];};
-layout (binding = 2) readonly  buffer DW  {float data_dw[];};
-layout (binding = 3) writeonly buffer D   {float data_d[];};
+layout (binding = 0) readonly  buffer CUR  {float data_c[];};
+layout (binding = 0) readonly  buffer CUR4 {vec4  data_c4[];};
+layout (binding = 1) readonly  buffer MSG  {float data_m[];};
+layout (binding = 1) readonly  buffer MSG4 {vec4  data_m4[];};
+layout (binding = 2) readonly  buffer DW   {float data_dw[];};
+layout (binding = 2) readonly  buffer DW4  {vec4  data_dw4[];};
+layout (binding = 3) writeonly buffer D    {float data_d[];};
 
 #define WG 256
 layout (local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
@@ -23,17 +26,30 @@ void main() {
     const uint k = gl_WorkGroupID.x;
     const uint t = gl_WorkGroupID.y;
     const uint tid = gl_LocalInvocationID.x;
-    const uint cb = t*p.n;
-    const uint db = k*2*p.n;
     vec4 acc = vec4(0.0); // sc, sm, ac, am
-    [[unroll]] for (uint it = 0; it < 16; ++it) {
-        const uint i = tid + it*WG;
-        if (i < p.n) {
+
+    if ((p.n & 3u) == 0u) {
+        const uint n4 = p.n >> 2;
+        const uint cb4 = t * n4;
+        const uint db4 = k * 2u * n4;
+        for (uint i = tid; i < n4; i += WG) {
+            const vec4 c = data_c4[cb4 + i];
+            const vec4 m = data_m4[cb4 + i];
+            acc.x += dot(c, c);
+            acc.y += dot(m, m);
+            acc.z += dot(data_dw4[db4 + i], c);
+            acc.w += dot(data_dw4[db4 + n4 + i], m);
+        }
+    } else {
+        const uint cb = t * p.n;
+        const uint db = k * 2u * p.n;
+        for (uint i = tid; i < p.n; i += WG) {
             const float c = data_c[cb + i];
             const float m = data_m[cb + i];
             acc += vec4(c*c, m*m, data_dw[db + i]*c, data_dw[db + p.n + i]*m);
         }
     }
+
     acc = subgroupAdd(acc);
     if (gl_SubgroupInvocationID == 0) {
         red[gl_SubgroupID] = acc;

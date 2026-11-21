@@ -25,15 +25,28 @@ void main() {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
+    const uint base = row * p.KX;
+    FLOAT_TYPE amax = -FLT_MAX;
     uint acol = col;
 
     if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
+        amax = FLOAT_TYPE(data_a[base + col]);
     }
 
-    for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
+    uint i = col + BLOCK_SIZE;
+    const uint stride4 = BLOCK_SIZE * 4u;
+    for (; i + BLOCK_SIZE * 3u < p.KX; i += stride4) {
+        const FLOAT_TYPE v0 = FLOAT_TYPE(data_a[base + i]);
+        const FLOAT_TYPE v1 = FLOAT_TYPE(data_a[base + i + BLOCK_SIZE]);
+        const FLOAT_TYPE v2 = FLOAT_TYPE(data_a[base + i + BLOCK_SIZE * 2u]);
+        const FLOAT_TYPE v3 = FLOAT_TYPE(data_a[base + i + BLOCK_SIZE * 3u]);
+        if (v0 > amax) { amax = v0; acol = i; }
+        if (v1 > amax) { amax = v1; acol = i + BLOCK_SIZE; }
+        if (v2 > amax) { amax = v2; acol = i + BLOCK_SIZE * 2u; }
+        if (v3 > amax) { amax = v3; acol = i + BLOCK_SIZE * 3u; }
+    }
+    for (; i < p.KX; i += BLOCK_SIZE) {
+        const FLOAT_TYPE val = FLOAT_TYPE(data_a[base + i]);
         if (val > amax) {
             amax = val;
             acol = i;
@@ -46,9 +59,11 @@ void main() {
     barrier();
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
         if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
-                tmpmax[col] = tmpmax[col + s];
-                tmp[col] = tmp[col + s];
+            const FLOAT_TYPE bmax = tmpmax[col + s];
+            const uint bcol = tmp[col + s];
+            if (tmpmax[col] < bmax || (tmpmax[col] == bmax && bcol < tmp[col])) {
+                tmpmax[col] = bmax;
+                tmp[col] = bcol;
             }
         }
         barrier();

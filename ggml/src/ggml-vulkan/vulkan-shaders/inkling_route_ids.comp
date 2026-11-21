@@ -1,7 +1,11 @@
 #version 450
 
 // Inkling 2 MoE router: ids[0..k) of token t = top-k of sigmoid(logits) + bias, descending, ties to the lower index.
-// One workgroup per token; each expert's rank is the number of experts that beat it.
+// Fast path (n_exp <= 128): 128 threads (1 expert per thread), k rounds of subgroupMax + ballot tie-breaking.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
 
 layout (push_constant) uniform parameter { uint n_exp; uint k; uint T; } p;
 
@@ -9,8 +13,11 @@ layout (binding = 0) readonly  buffer L  {float data_l[];};
 layout (binding = 1) readonly  buffer B  {float data_b[];};
 layout (binding = 2) writeonly buffer D  {int   data_d[];};
 
-layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout (local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
+shared float sg_val[16];
+shared uint  sg_idx[16];
+shared uint  best_shared;
 shared float v[1024];
 
 void main() {
@@ -18,14 +25,48 @@ void main() {
     if (t >= p.T) {
         return;
     }
-    for (uint i = gl_LocalInvocationID.x; i < p.n_exp; i += 256) {
-        v[i] = 1.0/(1.0 + exp(-data_l[t*p.n_exp + i])) + data_b[i];
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = t*p.n_exp;
+
+    if (p.n_exp <= 128u) {
+        float my_v = (tid < p.n_exp) ? (1.0/(1.0 + exp(-data_l[base + tid])) + data_b[tid]) : (-1.0/0.0);
+        for (uint r = 0u; r < p.k; ++r) {
+            const float sm = subgroupMax(my_v);
+            const uvec4 bal = subgroupBallot(my_v == sm);
+            const uint lane = subgroupBallotFindLSB(bal);
+            if (gl_SubgroupInvocationID == 0u) {
+                sg_val[gl_SubgroupID] = sm;
+                sg_idx[gl_SubgroupID] = gl_SubgroupID * gl_SubgroupSize + lane;
+            }
+            barrier();
+            if (tid == 0u) {
+                float bv = sg_val[0];
+                uint  bi = sg_idx[0];
+                for (uint g = 1u; g < gl_NumSubgroups; ++g) {
+                    if (sg_val[g] > bv || (sg_val[g] == bv && sg_idx[g] < bi)) {
+                        bv = sg_val[g];
+                        bi = sg_idx[g];
+                    }
+                }
+                best_shared = bi;
+                data_d[t*p.k + r] = int(bi);
+            }
+            barrier();
+            if (tid == best_shared) {
+                my_v = -1.0/0.0;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < p.n_exp; i += 128u) {
+        v[i] = 1.0/(1.0 + exp(-data_l[base + i])) + data_b[i];
     }
     barrier();
-    for (uint i = gl_LocalInvocationID.x; i < p.n_exp; i += 256) {
+    for (uint i = tid; i < p.n_exp; i += 128u) {
         const float vi = v[i];
-        uint rank = 0;
-        for (uint j = 0; j < p.n_exp; ++j) {
+        uint rank = 0u;
+        for (uint j = 0u; j < p.n_exp; ++j) {
             const float vj = v[j];
             rank += (vj > vi || (vj == vi && j < i)) ? 1u : 0u;
         }

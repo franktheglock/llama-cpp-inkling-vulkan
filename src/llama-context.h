@@ -258,6 +258,18 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    void set_dspark_context(const float * data, size_t n_floats, int32_t n_steps = 0) {
+        dspark_ctx_embd.assign(data, data + n_floats);
+        dspark_n_steps = n_steps;
+    }
+
+    const int32_t * get_dspark_tokens(size_t * n_out) const {
+        if (n_out) {
+            *n_out = dspark_tokens.size();
+        }
+        return dspark_tokens.empty() ? nullptr : dspark_tokens.data();
+    }
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -383,6 +395,11 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // Inkling2 DSpark recurrent head context features [n_embd * n_seq] and GPU-sampled draft token IDs
+    std::vector<float>   dspark_ctx_embd;
+    std::vector<int32_t> dspark_tokens;
+    int32_t              dspark_n_steps = 0;
 
     bool has_evaluated_once = false;
 

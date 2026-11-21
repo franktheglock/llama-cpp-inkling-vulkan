@@ -53,6 +53,7 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+bool                   common_sampler_can_use_backend(const struct common_sampler * gsmpl);
 
 // extended sampling implementation:
 //

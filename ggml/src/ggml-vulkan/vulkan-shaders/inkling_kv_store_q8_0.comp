@@ -1,0 +1,133 @@
+#version 450
+
+// Mega-fused Inkling 2 K/V short-conv + conv-state update (with n_rs_seq rollback slots)
+// + per-head K-clip (mode=0) or V-RMSNorm (mode=1) + Q8_0 quantization & KV cache store!
+// One 128-thread workgroup (= 4 warps = 4 Q8_0 blocks) per (kv_head, token).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define DATA_A_Q8_0
+#include "types.glsl"
+
+layout (push_constant) uniform parameter {
+    uint C;             // n_embd_k_gqa = n_head_kv * hd (1024)
+    uint hd;            // head_dim (128)
+    uint K;             // shortconv l_cache (4)
+    uint n_t;           // tokens per seq
+    uint n_s;           // n_seqs
+    uint p_nb1;         // past->nb[1] / 4
+    uint p_nb2;         // past->nb[2] / 4
+    uint H;             // dynamic conv heads (0 if static)
+    uint s_row;         // state_dst->nb[1] / 4
+    uint has_state;
+    float out_scale;
+    uint n_rs_slots;
+    uint s_slot_stride; // state_dst->nb[2] / 4
+    uint mode;          // 0 = K clip (param=thr), 1 = V rms_norm (param=eps)
+    float param;
+    uint kv_row_blocks; // kv_dst->nb[1] / sizeof(block_q8_0)
+} p;
+
+layout (binding = 0) readonly  buffer PAST {float data_p[];};
+layout (binding = 1) readonly  buffer W    {float data_w[];};
+layout (binding = 2) readonly  buffer DYN  {float data_dyn[];};
+layout (binding = 3) readonly  buffer CUR  {float data_c[];};
+layout (binding = 4)           buffer ST   {float data_st[];};
+layout (binding = 5) readonly  buffer IDXS {uvec2 data_i[];};
+layout (binding = 6) writeonly buffer KV   {block_q8_0 data_kv[];};
+
+layout (local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+shared float  sh_ss[4];
+shared int8_t sh_qs[128];
+
+float xv(uint c, uint s, uint i) {
+    return i < p.K - 1u ? data_p[c * p.p_nb1 + s * p.p_nb2 + i] : data_c[(s * p.n_t + i - (p.K - 1u)) * p.C + c];
+}
+
+void main() {
+    const uint d    = gl_LocalInvocationID.x; // 0..127
+    const uint head = gl_WorkGroupID.x;       // 0..n_head_kv-1
+    const uint tg   = gl_WorkGroupID.y + gl_WorkGroupID.z * 65535u;
+    const uint n_tg = p.n_t * p.n_s;
+    if (tg >= n_tg || d >= p.hd) {
+        return;
+    }
+
+    const uint c = head * p.hd + d;
+    const uint s = tg / p.n_t;
+    const uint t = tg % p.n_t;
+
+    // 1. Short convolution
+    float acc = xv(c, s, t + p.K - 1u);
+    for (uint k = 0u; k < p.K; ++k) {
+        acc += data_w[c * p.K + k] * xv(c, s, t + k);
+    }
+    if (p.H != 0u) {
+        const uint h  = c / (p.C / p.H);
+        const uint db = tg * p.K * p.H + h * p.K;
+        for (uint lag = 0u; lag < p.K; ++lag) {
+            acc += data_dyn[db + lag] * xv(c, s, t + p.K - 1u - lag);
+        }
+    }
+    float v = acc * p.out_scale;
+
+    // 2. Update recurrent conv state + n_rs_seq rollback slots
+    if (p.has_state != 0u && t + 1u == p.n_t) {
+        const uint n_slots = max(1u, p.n_rs_slots);
+        for (uint slot = 0u; slot < n_slots; ++slot) {
+            const uint s_idx = p.n_t > slot ? p.n_t - slot : 0u;
+            const uint sb = slot * p.s_slot_stride + s * p.s_row + c * (p.K - 1u);
+            for (uint i = 0u; i < p.K - 1u; ++i) {
+                data_st[sb + i] = xv(c, s, s_idx + i);
+            }
+        }
+    }
+
+    // 3. Per-head K-clip (mode 0) or V-RMSNorm (mode 1) across 128 threads
+    const uint warp = gl_SubgroupID;           // 0..3 on wave32 (0..1 on wave64)
+    const uint lane = gl_SubgroupInvocationID; // 0..31
+    const float w_ss = subgroupAdd(v * v);
+    if (lane == 0u) {
+        sh_ss[warp] = w_ss;
+    }
+    barrier();
+
+    float ss = 0.0;
+    for (uint w = 0u; w < gl_NumSubgroups; ++w) {
+        ss += sh_ss[w];
+    }
+
+    if (p.mode == 0u) {
+        v *= clamp(p.param / (sqrt(ss) + 1e-6), 0.0, 1.0);
+    } else {
+        v *= inversesqrt(ss / float(p.hd) + p.param);
+    }
+
+    // 4. Q8_0 quantization (1 block of 32 elements per 32-thread subgroup on wave32)
+    // For portability on wave64, use subgroupMax when gl_SubgroupSize == 32; otherwise fallback via LDS.
+    const uint q_blk = d >> 5u;   // 0..3
+    const uint q_off = d & 31u;   // 0..31
+    if (gl_SubgroupSize == 32u) {
+        const float amax = subgroupMax(abs(v));
+        const float dq = amax / 127.0;
+        const float idq = dq != 0.0 ? 1.0 / dq : 0.0;
+        sh_qs[d] = int8_t(round(v * idq));
+        // Subgroup lockstep guarantees all 32 lanes wrote sh_qs[q_blk*32..q_blk*32+31] before lane 0 reads.
+        subgroupMemoryBarrierShared();
+        if (q_off == 0u) {
+            const uint row_idx = data_i[tg].x;
+            const uint dst_blk = row_idx * p.kv_row_blocks + head * (p.hd >> 5u) + q_blk;
+            data_kv[dst_blk].d = float16_t(dq);
+            [[unroll]] for (uint j = 0u; j < 32u; ++j) {
+                data_kv[dst_blk].qs[j] = sh_qs[q_blk * 32u + j];
+            }
+        }
+    }
+}

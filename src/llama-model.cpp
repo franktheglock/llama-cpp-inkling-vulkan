@@ -2063,6 +2063,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             bufs.emplace_back(std::move(mbuf));
             pimpl->ctxs_bufs.emplace_back(std::move(mctx), std::move(bufs));
         }
+        // also merge loop_res_query + loop_kv_res_query into [n_embd, 4, n_core] so cross-pass depth mix runs once instead of twice
+        if (loop_res_query && loop_kv_res_query && ggml_is_contiguous(loop_res_query) && ggml_is_contiguous(loop_kv_res_query) &&
+            loop_res_query->type == loop_kv_res_query->type && loop_res_query->ne[0] == loop_kv_res_query->ne[0] &&
+            loop_res_query->ne[1] == loop_kv_res_query->ne[1] && loop_res_query->ne[1] % 2 == 0) {
+            const int64_t n_embd_q = loop_res_query->ne[0];
+            const int64_t n_core   = loop_res_query->ne[1] / 2;
+            const size_t  pair_nb  = 2 * loop_res_query->nb[1];
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(loop_res_query->buffer);
+            ggml_init_params ip_params = { /*.mem_size =*/ ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
+            ggml_context_ptr mctx { ggml_init(ip_params) };
+            ggml_tensor * tq = ggml_new_tensor_3d(mctx.get(), loop_res_query->type, n_embd_q, 4, n_core);
+            ggml_format_name(tq, "ink_loop_res_query.weight");
+            ggml_backend_buffer_ptr mbuf { ggml_backend_alloc_ctx_tensors_from_buft(mctx.get(), buft) };
+            if (mbuf) {
+                ggml_backend_buffer_set_usage(mbuf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                std::vector<uint8_t> b1(ggml_nbytes(loop_res_query));
+                std::vector<uint8_t> b2(ggml_nbytes(loop_kv_res_query));
+                std::vector<uint8_t> out(ggml_nbytes(tq));
+                ggml_backend_tensor_get(loop_res_query,    b1.data(), 0, b1.size());
+                ggml_backend_tensor_get(loop_kv_res_query, b2.data(), 0, b2.size());
+                for (int64_t c = 0; c < n_core; ++c) {
+                    memcpy(out.data() + (2*c + 0)*pair_nb, b1.data() + c*pair_nb, pair_nb);
+                    memcpy(out.data() + (2*c + 1)*pair_nb, b2.data() + c*pair_nb, pair_nb);
+                }
+                ggml_backend_tensor_set(tq, out.data(), 0, out.size());
+                ink_loop_res_query = tq;
+                std::vector<ggml_backend_buffer_ptr> bufs;
+                bufs.emplace_back(std::move(mbuf));
+                pimpl->ctxs_bufs.emplace_back(std::move(mctx), std::move(bufs));
+            }
+        }
         LLAMA_LOG_INFO("%s: inkling2: merged attention projections, %.1f MiB\n", __func__, n_bytes/1024.0/1024.0);
     }
 

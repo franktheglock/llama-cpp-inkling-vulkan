@@ -589,6 +589,12 @@ struct llama_layer {
     struct ggml_tensor * ffn_post_conv    = nullptr;
     struct ggml_tensor * ffn_res_query    = nullptr;
 
+    // inkling2 dspark
+    struct ggml_tensor * attn_k_ctx       = nullptr;
+    struct ggml_tensor * attn_v_ctx       = nullptr;
+    struct ggml_tensor * attn_k_ctx_norm  = nullptr;
+    struct ggml_tensor * dflare_norm      = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -679,10 +685,17 @@ struct llama_model {
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // dspark
-    struct ggml_tensor * dspark_markov_w1   = nullptr;
-    struct ggml_tensor * dspark_markov_w2   = nullptr;
-    struct ggml_tensor * dspark_conf_proj   = nullptr;
-    struct ggml_tensor * dspark_conf_proj_b = nullptr;
+    struct ggml_tensor * dspark_markov_w1    = nullptr;
+    struct ggml_tensor * dspark_markov_w2    = nullptr;
+    struct ggml_tensor * dspark_conf_proj    = nullptr;
+    struct ggml_tensor * dspark_conf_proj_b  = nullptr;
+    struct ggml_tensor * dspark_joint_proj   = nullptr;
+    struct ggml_tensor * dspark_joint_proj_b = nullptr;
+    struct ggml_tensor * dspark_mask_embd    = nullptr;
+    struct ggml_tensor * dspark_fuse         = nullptr;
+    struct ggml_tensor * dspark_norm         = nullptr;
+    struct ggml_tensor * dspark_hidden_out   = nullptr;
+    struct ggml_tensor * dspark_hidden_out_b = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -716,6 +729,7 @@ struct llama_model {
     struct ggml_tensor * output_res_query = nullptr; // inkling2: query of the final attention-residual mix
     struct ggml_tensor * loop_res_query    = nullptr; // inkling2 loop: cross-pass queries (attn, mlp per core layer)
     struct ggml_tensor * loop_kv_res_query = nullptr; // inkling2 loop: cross-pass queries (k, v per core layer)
+    struct ggml_tensor * ink_loop_res_query = nullptr; // inkling2 merged cross-pass queries: [n_embd, 4, n_core] (attn, mlp, k, v)
 
     // list of devices used in this model
     std::vector<llama_device> devices;

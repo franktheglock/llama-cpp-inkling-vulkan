@@ -1338,6 +1338,8 @@ struct llama_model_dflash : public llama_model_base {
     llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void load_hparams_inkling2(llama_model_loader & ml);
+    void load_tensors_inkling2(llama_model_loader & ml);
 
     // set when dflash.decoder_arch == "laguna": draft layers follow the Laguna
     // decoder contract (softplus attn gate, per-aux feature norms, context K/V
@@ -1357,6 +1359,10 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {
         graph_dsv4(const llama_model & model, const llm_graph_params & params);
+    };
+
+    struct graph_inkling2 : public llm_graph_context {
+        graph_inkling2(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -1954,7 +1960,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * state,
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
-                int64_t offset);
+                int64_t offset,
+                ggml_tensor * resid = nullptr);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

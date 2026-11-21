@@ -1,40 +1,81 @@
 #version 450
 
 // Inkling 2 loop controller gate: y[i, t] = (1 - tanh(dot(F[:, i], h[:, t])))*cur[i, t] + tanh(dot(G[:, i], h[:, t]))*msg[i, t]
-// One subgroup per output row: the lanes read the row of F and G contiguously (coalesced), then reduce.
+// Fast path for rank == 64 on wave32: 2 rows per subgroup (16 lanes/row, 100% lane utilization, 1-shot vec4 load).
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 layout (push_constant) uniform parameter { uint n; uint rank; uint T; } p;
 
 layout (binding = 0) readonly  buffer CUR {float data_c[];};
 layout (binding = 1) readonly  buffer MSG {float data_m[];};
 layout (binding = 2) readonly  buffer H   {float data_h[];};
+layout (binding = 2) readonly  buffer H4  {vec4  data_h4[];};
 layout (binding = 3) readonly  buffer F   {float data_f[];};
+layout (binding = 3) readonly  buffer F4  {vec4  data_f4[];};
 layout (binding = 4) readonly  buffer G   {float data_g[];};
+layout (binding = 4) readonly  buffer G4  {vec4  data_g4[];};
 layout (binding = 5) writeonly buffer D   {float data_d[];};
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 void main() {
     const uint t    = gl_WorkGroupID.y;
-    const uint i    = gl_WorkGroupID.x*gl_NumSubgroups + gl_SubgroupID;
     const uint lane = gl_SubgroupInvocationID;
+
+    if (p.rank == 64u && gl_SubgroupSize == 32u) {
+        const uint half_id = lane >> 4u;
+        const uint k = lane & 15u;
+        const uint i = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * 2u + half_id;
+        if (i >= p.n) {
+            return;
+        }
+        const vec4 hv = data_h4[t * 16u + k];
+        float af = dot(data_f4[i * 16u + k], hv);
+        float ag = dot(data_g4[i * 16u + k], hv);
+        af += subgroupShuffleXor(af, 8u);
+        ag += subgroupShuffleXor(ag, 8u);
+        af += subgroupShuffleXor(af, 4u);
+        ag += subgroupShuffleXor(ag, 4u);
+        af += subgroupShuffleXor(af, 2u);
+        ag += subgroupShuffleXor(ag, 2u);
+        af += subgroupShuffleXor(af, 1u);
+        ag += subgroupShuffleXor(ag, 1u);
+        if (k == 0u) {
+            const uint o = t * p.n + i;
+            data_d[o] = (1.0 - tanh(af)) * data_c[o] + tanh(ag) * data_m[o];
+        }
+        return;
+    }
+
+    const uint i = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
     if (i >= p.n) {
         return;
     }
     float af = 0.0, ag = 0.0;
-    for (uint k = lane; k < p.rank; k += gl_SubgroupSize) {
-        const float hv = data_h[t*p.rank + k];
-        af += data_f[i*p.rank + k]*hv;
-        ag += data_g[i*p.rank + k]*hv;
+    if ((p.rank & 3u) == 0u) {
+        const uint r4 = p.rank >> 2u;
+        const uint hb4 = t * r4;
+        const uint wb4 = i * r4;
+        for (uint k = lane; k < r4; k += gl_SubgroupSize) {
+            const vec4 hv = data_h4[hb4 + k];
+            af += dot(data_f4[wb4 + k], hv);
+            ag += dot(data_g4[wb4 + k], hv);
+        }
+    } else {
+        for (uint k = lane; k < p.rank; k += gl_SubgroupSize) {
+            const float hv = data_h[t * p.rank + k];
+            af += data_f[i * p.rank + k] * hv;
+            ag += data_g[i * p.rank + k] * hv;
+        }
     }
     af = subgroupAdd(af);
     ag = subgroupAdd(ag);
-    if (lane == 0) {
-        const uint o = t*p.n + i;
-        data_d[o] = (1.0 - tanh(af))*data_c[o] + tanh(ag)*data_m[o];
+    if (lane == 0u) {
+        const uint o = t * p.n + i;
+        data_d[o] = (1.0 - tanh(af)) * data_c[o] + tanh(ag) * data_m[o];
     }
 }

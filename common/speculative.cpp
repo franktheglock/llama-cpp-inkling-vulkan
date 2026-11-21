@@ -939,6 +939,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
+    bool       is_dspark_inkling2 = false;
+    bool       sample_from_anchor = true;
+
+    // Inkling2 DSpark recurrent head committed anchor features [n_seq * context_rows, n_embd_dec]
+    size_t                 context_rows = 0;
+    std::vector<float>     context_embd;
+    std::vector<llama_pos> context_pos;
+    std::vector<float>     dspark_ctx_batch;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -960,6 +968,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const llama_model * model_dft = llama_get_model(ctx_dft);
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
 
+        is_dspark_inkling2 = llama_model_is_dspark_inkling2(model_dft);
+
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
         GGML_ASSERT(target_layer_ids_n > 0 && "DFlash model has no target_layer_ids");
@@ -975,16 +985,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
             }
+            if (llama_model_meta_val_str(model_dft, "dflash.sample_from_anchor", buf, sizeof(buf)) >= 0) {
+                sample_from_anchor = std::strcmp(buf, "true") == 0;
+            }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        if (is_dspark_inkling2) {
+            if (this->params.p_min > 0.0f) {
+                LOG_WRN("%s: Inkling2 DSpark has no confidence head; clamping p_min=%.2f to 0.0\n",
+                        __func__, this->params.p_min);
+                this->params.p_min = 0.0f;
+            }
+            if (n_embd_tgt != n_embd_dec || target_layer_ids[target_layer_ids_n - 1] != llama_model_n_layer(model_tgt)) {
+                throw std::runtime_error("Inkling2 DSpark target feature dimensions do not match");
+            }
+            context_rows = (size_t) block_size + 1;
+            const size_t slots = (size_t) n_seq * context_rows;
+            context_embd.resize(slots * (size_t) n_embd_dec);
+            context_pos.assign(slots, -1);
+        }
+
+        LOG_INF("%s: adding speculative implementation '%s'%s\n", __func__,
+                common_speculative_type_to_str(type).c_str(),
+                is_dspark_inkling2 ? " (inkling2)" : "");
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, sample_from_anchor=%s\n", __func__,
+                this->params.n_max, this->params.n_min, this->params.p_min,
+                sample_from_anchor ? "true" : "false");
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
-        // block_size-1 draft tokens, DSpark yield a full block_size draft tokens
-        const int32_t n_draft_max = is_dspark ? block_size : block_size - 1;
+        // block_size-1 draft tokens; anchor-first DSpark yields a full block_size draft tokens
+        const int32_t n_draft_max = (is_dspark && sample_from_anchor) ? block_size : block_size - 1;
         if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
             LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained block size %d -- clamping to %d\n",
                     __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
@@ -992,15 +1024,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,                                       n_seq);
+        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), is_dspark_inkling2 ? n_embd_enc : n_embd_dec, n_seq);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
-            sparams.no_perf  = false;
-            sparams.top_k    = 10;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            sparams.no_perf = false;
+            if (is_dspark_inkling2) {
+                // Inkling2 uses host greedy sampling to keep the first-maximum tie rule.
+                sparams.temp     = 0.0f;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TEMPERATURE };
+            } else {
+                sparams.top_k    = 10;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            }
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
@@ -1016,7 +1054,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dspark_inkling2);
 
         // generic DFlash drafts with non-causal block attention; Laguna drafters
         // are trained with a causal noise block
@@ -1025,6 +1063,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
                 causal = strcmp(buf, "laguna") == 0;
+            }
+            if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
+                causal = strcmp(buf, "true") == 0;
             }
             llama_set_causal_attn(ctx_dft, causal);
         }
@@ -1146,42 +1187,77 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                // fuse extracted features through DFlash encoder
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
+                if (is_dspark_inkling2) {
+                    // Inkling2 DSpark fuses features directly inside the decoder injection graph
+                    batch_inject.n_tokens = n_chunk;
+                    std::memcpy(batch_inject.embd, features_buf.data(), (size_t) n_chunk * n_embd_enc * sizeof(float));
 
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
+                    }
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    // Save committed context features from h_nextn for the recurrent Markov head
+                    const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                    if (projected) {
+                        const size_t seq_offset = (size_t) seq_id * context_rows;
+                        const llama_pos pos_min = std::max(0, batch_inject.pos[n_chunk - 1] - block_size);
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            const llama_pos pos = batch_inject.pos[i];
+                            if (pos < pos_min) {
+                                continue;
+                            }
+                            const size_t slot = seq_offset + (size_t) pos % context_rows;
+                            std::memcpy(context_embd.data() + slot * (size_t) n_embd_dec,
+                                    projected + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                            context_pos[slot] = pos;
+                        }
+                    }
+                } else {
+                    // fuse extracted features through DFlash encoder
+                    llama_batch enc_batch = {
+                        /*.n_tokens =*/ n_chunk,
+                        /*.token    =*/ nullptr,
+                        /*.embd     =*/ features_buf.data(),
+                        /*.pos      =*/ nullptr,
+                        /*.n_seq_id =*/ nullptr,
+                        /*.seq_id   =*/ nullptr,
+                        /*.logits   =*/ nullptr,
+                    };
 
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+                    int32_t rc = llama_encode(ctx_dft, enc_batch);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
 
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                    const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                    GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
-                }
-                rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
+                    // inject the DFlash decoder K/V cache at the tokens' target positions
+                    batch_inject.n_tokens = n_chunk;
+                    std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
+                    }
+                    rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
                 }
             }
         }
@@ -1193,11 +1269,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
+        dspark_ctx_batch.clear();
 
         // build one batch holding every drafting sequence's noise block into a single decode)
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        const int32_t i_draft_beg = (is_dspark && sample_from_anchor) ? 0 : 1;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1217,7 +1295,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n_draft = params.n_max;
 
-            const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
+            if (is_dspark_inkling2) {
+                const llama_pos pos = n - 1;
+                const size_t slot = (size_t) seq_id * context_rows + (size_t) pos % context_rows;
+                if (pos < 0 || context_pos[slot] != pos) {
+                    LOG_WRN("%s: Inkling2 DSpark committed context feature missing for pos=%d (slot pos=%d)\n",
+                            __func__, (int) pos, (int) context_pos[slot]);
+                    return;
+                }
+                const float * ctx_ptr = context_embd.data() + slot * (size_t) n_embd_dec;
+                dspark_ctx_batch.insert(dspark_ctx_batch.end(), ctx_ptr, ctx_ptr + n_embd_dec);
+            }
+
+            // Later mask rows affect earlier predictions through noncausal attention.
+            const int32_t n_block_tokens = is_dspark_inkling2 ? block_size : (i_draft_beg + n_draft);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1229,12 +1320,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        if (is_dspark_inkling2) {
+            const int32_t n_steps = std::min(params.n_max, block_size - 1);
+            llama_set_dspark_context(ctx_dft, dspark_ctx_batch.data(), dspark_ctx_batch.size(), n_steps);
+        }
+
         // decode all sequence's noise block in a single batch
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
+
+        size_t n_dspark_toks = 0;
+        const int32_t * dspark_toks = is_dspark_inkling2 ? llama_get_dspark_tokens(ctx_dft, &n_dspark_toks) : nullptr;
+        int32_t dspark_seq_idx = 0;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1249,12 +1349,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
-            if (is_dspark) {
-                // DSpark predicts the next token from position 0 and optionally truncates
+            if (is_dspark_inkling2) {
+                const int32_t n_slots = std::min(params.n_max, block_size - 1);
+                GGML_ASSERT(dspark_toks != nullptr && (size_t) (dspark_seq_idx + 1) * n_slots <= n_dspark_toks);
+                for (int32_t k = 0; k < n_slots; ++k) {
+                    const llama_token sampled = dspark_toks[(size_t) dspark_seq_idx * n_slots + k];
+                    result.push_back(sampled);
+                }
+                ++dspark_seq_idx;
+            } else if (is_dspark) {
+                // DSpark predicts the next token from i_draft_beg and optionally truncates
                 // at the first position below the confidence threshold.
                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
-                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                for (int32_t i = i_draft_beg; i < i_draft_beg + params.n_max && i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
                     if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
@@ -2858,6 +2966,16 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->model.reset(model_dft);
+
+        if (llama_model_is_dspark_inkling2(model_dft)) {
+            char buf[32] = {};
+            const uint32_t bsz = llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0
+                ? (uint32_t) std::max(1, std::atoi(buf)) : 8u;
+            const uint32_t rows = bsz * cparams.n_seq_max;
+            cparams.n_batch       = std::max(cparams.n_batch, rows);
+            cparams.n_ubatch      = cparams.n_ubatch ? std::max(cparams.n_ubatch, rows) : 0;
+            cparams.n_outputs_max = cparams.n_outputs_max ? std::max(cparams.n_outputs_max, rows) : 0;
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
