@@ -2462,6 +2462,17 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    GGML_API bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a);
+
+    // Add table[indices[key, query], head, query] to the mask before its F16 rounding (adapted from upstream #32740;
+    // this fork keeps the bins innermost so neighbouring keys read neighbouring table entries).
+    // table:   F32 [n_bins, n_head, n_query] (queries of all streams flattened in stream order)
+    // indices: I32 [n_kv, n_query], bins >= n_bins add nothing
+    GGML_API void ggml_flash_attn_ext_add_indexed_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * indices);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

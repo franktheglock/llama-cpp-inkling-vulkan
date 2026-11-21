@@ -2926,6 +2926,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    // indexed bias (Inkling): table [n_bins, n_head, n_tokens] gathered by indices [n_kv, n_tokens]
+    ggml_tensor * bias_table   = fa_bias_table;
+    ggml_tensor * bias_indices = fa_bias_indices;
+    auto dense_bias_mask = [&]() {
+        // fallback: materialize the per-head mask (n_kv x n_tokens x n_head)
+        ggml_tensor * bias = ggml_get_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, bias_table, 1, 0, 2, 3)), bias_indices);
+        bias = ggml_reshape_4d(ctx0, bias, q->ne[2], bias_indices->ne[0], q->ne[1], n_stream);
+        bias = ggml_cont(ctx0, ggml_permute(ctx0, bias, 2, 0, 1, 3));
+        cb(bias, "kq_b", il);
+        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        if (mask->ne[1] != bias->ne[1]) {
+            mask = ggml_view_4d(ctx0, mask, mask->ne[0], bias->ne[1], mask->ne[2], mask->ne[3], mask->nb[1], mask->nb[2], mask->nb[3], 0);
+        }
+        mask = ggml_add(ctx0, bias, mask);
+        if (cparams.flash_attn) {
+            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        }
+        cb(mask, "kq_mask_rel_pos", il);
+        return mask;
+    };
+
     // TurboQuant note: graph-side Q rotation (pre-rotate-queries) is implemented below
     // in the flash-attn path. The VEC kernel bug (wrong Q/K stride in
     // vec_dot_fattn_vec_KQ_turbo3_0) was fixed in fattn-common.cuh to match f16 pattern.
@@ -2957,6 +2978,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        if (bias_table) {
+            ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
+            // supported if any non-CPU backend of the scheduler can run it (the CPU backend never does)
+            bool supported = false;
+            if (cparams.offload_kqv && sched) {
+                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched) && !supported; ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+                    supported = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                                ggml_backend_dev_supports_op(dev, cur);
+                }
+            }
+            if (!supported) {
+                ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
+                cur->src[3] = dense_bias_mask();
+            }
+        }
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
@@ -2991,6 +3029,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        if (bias_table) {
+            kq_mask = dense_bias_mask();
+        }
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 
@@ -4180,8 +4221,15 @@ ggml_tensor * llm_graph_context::build_attn_premasked(
         ggml_tensor * kq_mask_full,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
-    return build_attn_iswa_impl(*this, inp->get_attn(), nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, nullptr, kq_mask_full, sinks, nullptr, kq_scale, il);
+            int       il,
+        ggml_tensor * bias_table,
+        ggml_tensor * bias_indices) const {
+    fa_bias_table   = bias_table;
+    fa_bias_indices = bias_indices;
+    ggml_tensor * cur = build_attn_iswa_impl(*this, inp->get_attn(), nullptr, nullptr, nullptr, q_cur, k_cur, v_cur, nullptr, kq_mask_full, sinks, nullptr, kq_scale, il);
+    fa_bias_table   = nullptr;
+    fa_bias_indices = nullptr;
+    return cur;
 }
 
 void llm_graph_context::build_dense_out(

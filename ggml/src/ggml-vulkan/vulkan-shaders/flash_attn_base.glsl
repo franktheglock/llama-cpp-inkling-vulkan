@@ -24,6 +24,9 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+// indexed bias: mask += table[idx[key, query], head, query] (bins >= BIAS_N_BINS add nothing)
+const bool INDEXED_BIAS    = (Flags & 16) != 0;
+const uint32_t BIAS_N_BINS = (Flags >> 16) & 0x7fff;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -81,6 +84,9 @@ layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
+
+layout (binding = 7) readonly buffer BT {float   data_bias_table[];};
+layout (binding = 8) readonly buffer BI {int32_t data_bias_idx[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2

@@ -224,6 +224,16 @@ void main() {
                     if (idx + tid < Bc * Br) {
                         if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || i * Br + r < p.nem1)) {
                             FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
+                            if (INDEXED_BIAS && i * Br + r < p.N) {
+                                const uint32_t query = iq3 * p.N + i * Br + r;
+                                const uint32_t bin   = uint32_t(data_bias_idx[query * KV + j * Bc + c]);
+                                if (bin < BIAS_N_BINS) {
+                                    // same F16 rounding as a materialized mask
+                                    const float mb = float(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]) +
+                                            data_bias_table[(query * p.neq2 + iq2) * BIAS_N_BINS + bin];
+                                    m = FLOAT_TYPE(unpackHalf2x16(packHalf2x16(vec2(mb, 0.0))).x);
+                                }
+                            }
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {

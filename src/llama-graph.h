@@ -1237,6 +1237,10 @@ struct llm_graph_context {
     // attention
     //
 
+    // indexed attention bias for the next build_attn_mha() call (set/cleared by build_attn_premasked)
+    mutable ggml_tensor * fa_bias_table   = nullptr;
+    mutable ggml_tensor * fa_bias_indices = nullptr;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1441,7 +1445,9 @@ struct llm_graph_context {
             ggml_tensor * kq_mask_full,
             ggml_tensor * sinks,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * bias_table   = nullptr,  // [n_bins, n_head, n_tokens]: added in flash attention by index
+            ggml_tensor * bias_indices = nullptr) const; // [n_kv, n_tokens] bins into bias_table
 
     // kq_b is added to the KQ mask, after the KQ scale
     ggml_tensor * build_attn(

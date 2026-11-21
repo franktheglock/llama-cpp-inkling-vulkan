@@ -338,7 +338,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     {
         static const bool unfused = getenv("INKLING_UNFUSED") != nullptr;
-        static const int  fmask   = getenv("INKLING_FUSED_MASK") ? atoi(getenv("INKLING_FUSED_MASK")) : 255;
+        static const int  fmask   = getenv("INKLING_FUSED_MASK") ? atoi(getenv("INKLING_FUSED_MASK")) : 511;
         fused = !unfused;
         fused_mask = unfused ? 0 : fmask;
     }
@@ -576,7 +576,20 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
 
             ggml_tensor * sinks = proj_small(layer.attn_sink_proj, inputs[0]);
 
-            if (fused_mask & 16) {
+            if ((fused_mask & 256) && cparams.flash_attn) {
+                // indexed bias: flash attention adds table[head, rel_pos[key, query], query] to the shared input mask while
+                // loading it, so the per-head n_kv x n_tokens x n_head mask is never materialized (adapted from upstream #32740)
+                ggml_tensor * mask_in = is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask;
+                // [n_extent + 1, n_head, n_tokens]: rel_pos == n_extent is the zero row; minus the per-query sink logit
+                ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+                table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+                cb(table, "rel_bias_table", il);
+
+                if (!zero_sinks) {
+                    zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+                }
+                cur = build_attn_premasked(inp, Qcur, Kcur, Vcur, mask_in, zero_sinks, 1.0f/sqrtf(n_embd_head), il, table, rel_pos);
+            } else if (fused_mask & 16) {
                 // one kernel: input mask + gathered relative bias - per-query sink, per head, in the type flash attention takes
                 ggml_tensor * mask_in = is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask;
                 const ggml_type mask_type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
