@@ -705,6 +705,12 @@ struct mtmd_context {
                     img_end = "<|image_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_muse_glimmer>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_INKLING2V:
+                {
+                    // the chat template code gives the image its own message block (inkling_split_media)
+                    img_beg = "<|content_image|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_inkling2v>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_YOUTUVL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>

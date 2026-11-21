@@ -1286,6 +1286,52 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const cli
 }
 
 //
+// mtmd_image_preprocessor_inkling2v
+//
+
+mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const clip_image_u8 & input) {
+    const int align = hparams.patch_size * hparams.n_merge;
+    auto size = input.get_size();
+    clip_image_u8 resized;
+    const bool too_large = hparams.image_max_pixels > 0 &&
+        int64_t(CLIP_ALIGN(size.width, align)) * CLIP_ALIGN(size.height, align) > hparams.image_max_pixels;
+    if (too_large) {
+        // the reference does not resize; this only bounds the number of image tokens
+        size = img_tool::calc_size_preserved_ratio(size, align, 0, hparams.image_max_pixels);
+        img_tool::resize(input, resized, size, hparams.image_resize_algo, PAD_NONE);
+    }
+    const clip_image_u8 & img = too_large ? resized : input;
+    const int width  = CLIP_ALIGN(size.width,  align);
+    const int height = CLIP_ALIGN(size.height, align);
+    clip_image_f32 padded;
+    padded.set_size({width, height}, img.is_placeholder(), false);
+    if (!img.is_placeholder()) {
+        // padding is -1 before rescale + normalization, as in the reference
+        std::vector<float> pixels(size_t(width) * height * 3, -1.0f);
+        const auto & src = img.get_ro_buf();
+        for (int y = 0; y < size.height; ++y) {
+            for (int i = 0; i < size.width * 3; ++i) {
+                pixels[size_t(y) * width * 3 + i] = float(src[size_t(y) * size.width * 3 + i]);
+            }
+        }
+        // match the reference's fused rescale and normalization, including the padding
+        float mean[3], std[3];
+        for (int c = 0; c < 3; ++c) {
+            mean[c] = hparams.image_mean[c] * 255.0f;
+            std[c]  = hparams.image_std[c]  * 255.0f;
+        }
+        for (size_t i = 0; i < pixels.size(); ++i) {
+            const int c = i % 3;
+            pixels[i] = (pixels[i] - mean[c]) / std[c];
+        }
+        padded.cpy_buf(pixels);
+    }
+    mtmd_image_preproc_out result;
+    result.append(hparams, padded, false);
+    return result;
+}
+
+//
 // mtmd_image_preprocessor_step3vl
 //
 

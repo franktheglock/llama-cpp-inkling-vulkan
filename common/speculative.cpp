@@ -1099,21 +1099,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        // Target prefill may contain token IDs or multimodal embeddings (image chunks).
-        // Image chunks are not mirrored into the draft: their target-layer features are
-        // vision states the draft was never trained on, and their M-RoPE positions collapse
-        // onto one temporal position, so injecting them poisons every draft after the
-        // image (acceptance fell from ~0.5 to ~0.03 for the rest of the conversation).
-        // Skipping them leaves a gap in the draft's cache between the text before and after
-        // the image; the draft keeps the target's positions, and the text tokens after the
-        // image carry the image's influence in their injected features. The gap is fine for
-        // the default sliding-window draft cache: every batch it does see has consecutive
-        // positions, which is all find_slot requires (the crash was the image batch itself,
-        // whose tokens all carry one temporal position). No server-side change is involved.
+        // Target prefill may contain token IDs or multimodal embeddings. Both produce the
+        // target-layer features used to seed the draft KV cache, so embeddings are injected
+        // too (the draft reads target hidden states, not the image embeddings themselves),
+        // except M-RoPE images whose rows are pinned to one position - skipped below.
+        // (ported from upstream common/speculative.cpp, #32016)
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
         const bool has_tokens     = batch_in.token != nullptr;
         const bool has_embeddings = batch_in.embd  != nullptr;
-        if (!has_tokens || has_embeddings) {
+        if (has_tokens == has_embeddings) {
             return true;
         }
 
@@ -1144,6 +1138,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            // an M-RoPE image pins all its rows to one position, so a windowed draft
+            // cache cannot free cells for it - skip it, the draft can jump over the gap
+            const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
+            if (has_embeddings && n_rows > 1 && pos_pinned) {
+                continue;
+            }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
