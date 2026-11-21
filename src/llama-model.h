@@ -570,6 +570,9 @@ struct llama_layer {
     struct ggml_tensor * attn_q_clip      = nullptr;
     struct ggml_tensor * attn_rel_clip    = nullptr;
     struct ggml_tensor * attn_sink_proj   = nullptr;
+    // inkling2 merged projections, built at load time (rows: q | rel | gate, and q | k | v | rel | gate)
+    struct ggml_tensor * ink_qrg   = nullptr;
+    struct ggml_tensor * ink_qkvrg = nullptr;
     // inkling2 loop controllers: q, k, v, mlp
     struct ggml_tensor * loop_down[4]     = {};
     struct ggml_tensor * loop_gain[4]     = {};

@@ -2646,6 +2646,11 @@ extern "C" {
         GGML_INKLING_CONV    = 2, // short causal conv with residual, optional dynamic per-head taps, output scale
         GGML_INKLING_GATE    = 3, // (1 - tanh(f))*cur + tanh(g)*msg
         GGML_INKLING_RELMASK = 4, // mask + table[rel_pos] - sink, per head
+        GGML_INKLING_RELBIAS = 6, // like RELMASK, the bias computed from the rel_bias weight and r: sum_r w[r, rel_pos]*r[r, h, t]
+        GGML_INKLING_CTRL_DOWN = 7, // h = D [rms(cur); rms(msg)]
+        GGML_INKLING_CTRL_GATE = 8, // (1 - tanh(F h))*cur + tanh(G h)*msg
+        GGML_INKLING_CONV_STATE = 9, // CONV reading the history and the input directly, writing the new conv state
+        GGML_INKLING_SITU    = 5, // MoE SITU on a merged [gate | up] row: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
     };
 
     // x: [d, rows_per_token, T] f32 contiguous; scale: [d] or [d, rows_per_token] or NULL; tau: [T] or NULL
@@ -2693,7 +2698,52 @@ extern "C" {
             struct ggml_tensor  * sinks,
             struct ggml_tensor  * rel_pos,
             struct ggml_tensor  * mask,
-            enum ggml_type        type);        // NULL = no InnerQ scaling
+            enum ggml_type        type);
+
+    // gate_up: [2*n_ff, ...] f32 with contiguous rows (gate = first half, up = second half); result: [n_ff, ...]
+    // rel_w: [n_rel, n_ext] f32 (bias weight); r: [n_rel, n_head, T] f32 contiguous; others as ggml_inkling_relmask
+    GGML_API struct ggml_tensor * ggml_inkling_relbias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rel_w,
+            struct ggml_tensor  * r,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask,
+            enum ggml_type        type);
+
+    // cur, msg: [n, T]; down: [2n, rank] f32 -> [rank, T]; each half rms-normalized with eps
+    GGML_API struct ggml_tensor * ggml_inkling_ctrl_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * down,
+            float                 eps);
+
+    // cur, msg: [n, T]; h: [rank, T]; forget, gain: [rank, n] f32 -> [n, T]
+    GGML_API struct ggml_tensor * ggml_inkling_ctrl_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * h,
+            struct ggml_tensor  * forget,
+            struct ggml_tensor  * gain);
+
+    // past: [K-1, C, n_seqs] f32 (rows contiguous); cur: [C, n_t*n_seqs] contiguous; weight: [K, C]; dynamic as ggml_inkling_conv
+    // state_dst: [(K-1)*C, n_seqs] f32 view whose rows receive the last K-1 inputs per channel (written as a side effect), or NULL
+    GGML_API struct ggml_tensor * ggml_inkling_conv_state(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * dynamic,
+            struct ggml_tensor  * state_dst,
+            float                 out_scale);
+
+    GGML_API struct ggml_tensor * ggml_inkling_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate_up,
+            float                 beta,
+            float                 linear_beta);        // NULL = no InnerQ scaling
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(

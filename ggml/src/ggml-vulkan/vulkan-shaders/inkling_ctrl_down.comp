@@ -1,0 +1,51 @@
+#version 450
+
+// Inkling 2 loop controller down projection: h[k, t] = rc*dot(D[0:n, k], cur[:, t]) + rm*dot(D[n:2n, k], msg[:, t])
+// rc, rm: rms factors of cur and msg. One 256-thread workgroup per (k, t).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameter { uint n; uint rank; uint T; float eps; } p;
+
+layout (binding = 0) readonly  buffer CUR {float data_c[];};
+layout (binding = 1) readonly  buffer MSG {float data_m[];};
+layout (binding = 2) readonly  buffer DW  {float data_dw[];};
+layout (binding = 3) writeonly buffer D   {float data_d[];};
+
+#define WG 256
+layout (local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+shared vec4 red[WG/8];
+
+void main() {
+    const uint k = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint cb = t*p.n;
+    const uint db = k*2*p.n;
+    vec4 acc = vec4(0.0); // sc, sm, ac, am
+    [[unroll]] for (uint it = 0; it < 16; ++it) {
+        const uint i = tid + it*WG;
+        if (i < p.n) {
+            const float c = data_c[cb + i];
+            const float m = data_m[cb + i];
+            acc += vec4(c*c, m*m, data_dw[db + i]*c, data_dw[db + p.n + i]*m);
+        }
+    }
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0) {
+        red[gl_SubgroupID] = acc;
+    }
+    barrier();
+    if (tid == 0) {
+        vec4 a = vec4(0.0);
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            a += red[g];
+        }
+        const float rc = inversesqrt(a.x/float(p.n) + p.eps);
+        const float rm = inversesqrt(a.y/float(p.n) + p.eps);
+        data_d[t*p.rank + k] = a.z*rc + a.w*rm;
+    }
+}

@@ -2618,6 +2618,42 @@ struct test_inkling : public test_case {
                 ggml_tensor * dyn = extra ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K*extra, T*b) : nullptr;
                 return ggml_inkling_conv(ctx, x, w, dyn, 0.3f);
             }
+            case 6: {
+                const int64_t n_rel = 16, n_ext = 32, n_head = b, n_kv = a;
+                ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rel, n_ext);
+                ggml_tensor * r  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, T);
+                ggml_tensor * sk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, T);
+                ggml_tensor * rp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, T);
+                ggml_tensor * m  = ggml_new_tensor_4d(ctx, (extra & 2) ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv, T, 1, 1);
+                return ggml_inkling_relbias(ctx, w, r, sk, rp, m, (extra & 1) ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            }
+            case 7: {
+                ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                ggml_tensor * d = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*a, b);
+                return ggml_inkling_ctrl_down(ctx, c, m, d, 1e-6f);
+            }
+            case 8: {
+                ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, b, T);
+                ggml_tensor * f = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, b, a);
+                ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, b, a);
+                return ggml_inkling_ctrl_gate(ctx, c, m, h, f, g);
+            }
+            case 9: {
+                const int64_t K = 4;
+                ggml_tensor * hist = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K - 1, a + 64, b);
+                ggml_tensor * past = ggml_view_3d(ctx, hist, K - 1, a, b, hist->nb[1], hist->nb[2], 64*hist->nb[1]);
+                ggml_tensor * cur  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T*b);
+                ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, a);
+                ggml_tensor * dyn  = extra ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K*extra, T*b) : nullptr;
+                return ggml_inkling_conv_state(ctx, past, cur, w, dyn, nullptr, 0.3f);
+            }
+            case 5: {
+                ggml_tensor * gu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*a, b, T);
+                return ggml_inkling_situ(ctx, gu, 1.5f, extra ? 2.0f : 0.0f);
+            }
             case GGML_INKLING_GATE: {
                 ggml_tensor * t[4];
                 for (int i = 0; i < 4; ++i) t[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
@@ -9047,6 +9083,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling(GGML_INKLING_CONV, 1024, 1, T, 8));
         test_cases.emplace_back(new test_inkling(GGML_INKLING_CONV, 2304, 2, T, 0));
         test_cases.emplace_back(new test_inkling(GGML_INKLING_GATE, 2304, 0, T, 0));
+        test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 0));
+        for (int e : {0, 1, 2, 3}) test_cases.emplace_back(new test_inkling(6, 256, 24, T, e));
+        test_cases.emplace_back(new test_inkling(7, 2304, 64, T, 0));
+        test_cases.emplace_back(new test_inkling(9, 1024, 1, T, 0));
+        test_cases.emplace_back(new test_inkling(9, 1024, 1, T, 8));
+        test_cases.emplace_back(new test_inkling(9, 2304, 2, T, 0));
+        test_cases.emplace_back(new test_inkling(8, 2304, 64, T, 0));
+        test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 1));
         for (int e : {0, 1, 2, 3}) {
             test_cases.emplace_back(new test_inkling(GGML_INKLING_RELMASK, 256, 24, T, e));
         }

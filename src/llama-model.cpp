@@ -2007,6 +2007,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // inkling2: stack the projections that read the same input into one matrix per layer, so decode runs one
+    // large mat-vec instead of up to five small ones (same type, rows are independent: a byte concatenation)
+    if (arch == LLM_ARCH_INKLING2 && getenv("INKLING_NO_MERGE") == nullptr) {
+        const int n_phys = (int) hparams.n_layer() - (int) hparams.loop_n_extra();
+        size_t n_bytes = 0;
+        for (int ip = 0; ip < n_phys; ++ip) {
+            // the visit slots past the core were re-pointed by the loop aliasing: read each physical layer at its first visit
+            auto & L = layers[hparams.loop_visit(ip)];
+            ggml_tensor * parts5[5] = { L.wq, L.wk, L.wv, L.attn_rel, L.wqkv_gate };
+            bool ok = true;
+            for (auto * t : parts5) {
+                ok = ok && t && t->type == L.wq->type && t->ne[0] == L.wq->ne[0] && ggml_is_contiguous(t) &&
+                     ggml_backend_buffer_get_type(t->buffer) == ggml_backend_buffer_get_type(L.wq->buffer);
+            }
+            if (!ok) {
+                LLAMA_LOG_WARN("%s: inkling2 layer %d: projections not mergeable, keeping them separate\n", __func__, ip);
+                continue;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(L.wq->buffer);
+            ggml_init_params ip_params = { /*.mem_size =*/ 2*ggml_tensor_overhead(), /*.mem_buffer =*/ NULL, /*.no_alloc =*/ true };
+            ggml_context_ptr mctx { ggml_init(ip_params) };
+            const int64_t rows3 = L.wq->ne[1] + L.attn_rel->ne[1] + L.wqkv_gate->ne[1];
+            const int64_t rows5 = rows3 + L.wk->ne[1] + L.wv->ne[1];
+            ggml_tensor * t3 = ggml_new_tensor_2d(mctx.get(), L.wq->type, L.wq->ne[0], rows3);
+            ggml_tensor * t5 = ggml_new_tensor_2d(mctx.get(), L.wq->type, L.wq->ne[0], rows5);
+            ggml_format_name(t3, "blk.%d.ink_qrg.weight", ip);
+            ggml_format_name(t5, "blk.%d.ink_qkvrg.weight", ip);
+            ggml_backend_buffer_ptr mbuf { ggml_backend_alloc_ctx_tensors_from_buft(mctx.get(), buft) };
+            if (!mbuf) {
+                throw std::runtime_error("inkling2: unable to allocate the merged projection buffer");
+            }
+            ggml_backend_buffer_set_usage(mbuf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<uint8_t> tmp;
+            auto fill = [&](ggml_tensor * dst, std::initializer_list<ggml_tensor *> srcs) {
+                size_t off = 0;
+                for (auto * src : srcs) {
+                    tmp.resize(ggml_nbytes(src));
+                    ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+                    ggml_backend_tensor_set(dst, tmp.data(), off, tmp.size());
+                    off += tmp.size();
+                }
+                GGML_ASSERT(off == ggml_nbytes(dst));
+            };
+            fill(t3, { L.wq, L.attn_rel, L.wqkv_gate });
+            fill(t5, { L.wq, L.wk, L.wv, L.attn_rel, L.wqkv_gate });
+            n_bytes += ggml_nbytes(t3) + ggml_nbytes(t5);
+            for (int il = 0; il < (int) hparams.n_layer(); ++il) {
+                if ((int) hparams.loop_layer(il) == ip) {
+                    layers[il].ink_qrg   = t3;
+                    layers[il].ink_qkvrg = t5;
+                }
+            }
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            bufs.emplace_back(std::move(mbuf));
+            pimpl->ctxs_bufs.emplace_back(std::move(mctx), std::move(bufs));
+        }
+        LLAMA_LOG_INFO("%s: inkling2: merged attention projections, %.1f MiB\n", __func__, n_bytes/1024.0/1024.0);
+    }
+
     if (!hadamard_weight_blocks.empty() || !hadamard_inverse_blocks.empty()) {
         struct hadamard_rotation {
             uint32_t block_size;

@@ -2436,7 +2436,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 const float beta = hparams.situ_beta;
                 const float lb   = hparams.situ_linear_beta;
 
-                // fused gate_up gives strided views; this fork's scale kernels need contiguous input
+                // merged gate_up: one fused kernel reads both halves of each row
+                if (cur->view_src && cur->view_src == up->view_src && cur->view_offs == 0 &&
+                    up->view_offs == (size_t) cur->ne[0]*sizeof(float) && cur->view_src->ne[0] == 2*cur->ne[0] &&
+                    getenv("INKLING_UNFUSED") == nullptr) {
+                    cur = ggml_inkling_situ(ctx0, cur->view_src, beta, lb);
+                    cb(cur, "ffn_moe_situ", il);
+                    break;
+                }
+                // strided views; this fork's scale kernels need contiguous input
                 if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
                 if (!ggml_is_contiguous(up))  { up  = ggml_cont(ctx0, up);  }
 

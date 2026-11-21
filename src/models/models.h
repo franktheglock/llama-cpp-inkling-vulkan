@@ -1940,7 +1940,7 @@ struct llama_model_inkling2 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
         bool fused = true; // INKLING_UNFUSED=1 selects the reference chains of stock ops
-        int  fused_mask = 31; // INKLING_FUSED_MASK: 1 clip, 2 mix, 4 conv, 8 gate, 16 relmask
+        int  fused_mask = 255; // INKLING_FUSED_MASK: 1 clip, 2 mix, 4 conv, 8 gate, 16 relmask, 32 relbias, 64 controller, 128 conv+state
         ggml_tensor * zero_sinks = nullptr;
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         // the nq outputs of mix as contiguous [n_embd, n_tokens] tensors

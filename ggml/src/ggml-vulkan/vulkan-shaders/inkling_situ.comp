@@ -1,0 +1,28 @@
+#version 450
+
+// Inkling 2 MoE SITU on merged [gate | up] rows: y = beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
+
+layout (push_constant) uniform parameter {
+    uint n_ff; uint ne1; uint ne2; uint nb1; uint nb2; uint n_rows; float beta; float lb;
+} p;
+
+layout (binding = 0) readonly  buffer GU {float data_gu[];};
+layout (binding = 1) writeonly buffer D  {float data_d[];};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint i   = gl_GlobalInvocationID.x;
+    const uint row = gl_WorkGroupID.y + gl_WorkGroupID.z*65535;
+    if (i >= p.n_ff || row >= p.n_rows) {
+        return;
+    }
+    const uint i1 = row % p.ne1;
+    const uint i2 = row / p.ne1;
+    const uint b  = i1*p.nb1 + i2*p.nb2;
+    const float g = data_gu[b + i];
+    const float u = data_gu[b + p.n_ff + i];
+    const float act = p.beta*tanh(g/p.beta)/(1.0 + exp(-g));
+    const float up  = p.lb > 0.0 ? p.lb*tanh(u/p.lb) : u;
+    data_d[row*p.n_ff + i] = act*up;
+}

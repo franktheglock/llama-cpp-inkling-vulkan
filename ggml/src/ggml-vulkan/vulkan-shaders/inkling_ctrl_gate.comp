@@ -1,0 +1,41 @@
+#version 450
+
+// Inkling 2 loop controller gate: y[i, t] = (1 - tanh(dot(F[:, i], h[:, t])))*cur[i, t] + tanh(dot(G[:, i], h[:, t]))*msg[i, t]
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter { uint n; uint rank; uint T; } p;
+
+layout (binding = 0) readonly  buffer CUR {float data_c[];};
+layout (binding = 1) readonly  buffer MSG {float data_m[];};
+layout (binding = 2) readonly  buffer H   {float data_h[];};
+layout (binding = 3) readonly  buffer F   {vec4  data_f[];};
+layout (binding = 4) readonly  buffer G   {vec4  data_g[];};
+layout (binding = 5) writeonly buffer D   {float data_d[];};
+
+layout (local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#define RANK_MAX 128
+shared vec4 hsh[RANK_MAX/4];
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint r4 = p.rank/4;
+    if (gl_LocalInvocationID.x < r4) {
+        const uint hb = t*p.rank + 4*gl_LocalInvocationID.x;
+        hsh[gl_LocalInvocationID.x] = vec4(data_h[hb], data_h[hb + 1], data_h[hb + 2], data_h[hb + 3]);
+    }
+    barrier();
+    if (i >= p.n) {
+        return;
+    }
+    float af = 0.0, ag = 0.0;
+    for (uint k = 0; k < r4; ++k) {
+        const vec4 hv = hsh[k];
+        af += dot(data_f[i*r4 + k], hv);
+        ag += dot(data_g[i*r4 + k], hv);
+    }
+    const uint o = t*p.n + i;
+    data_d[o] = (1.0 - tanh(af))*data_c[o] + tanh(ag)*data_m[o];
+}

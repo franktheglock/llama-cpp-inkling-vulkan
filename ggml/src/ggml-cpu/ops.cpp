@@ -11509,6 +11509,150 @@ static void ggml_inkling_relmask_f32(const ggml_compute_params * params, ggml_te
     }
 }
 
+static void ggml_inkling_situ_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * gu = dst->src[0];
+    const float beta = ggml_get_op_params_f32(dst, 1);
+    const float lb   = ggml_get_op_params_f32(dst, 2);
+    const int64_t n_ff   = dst->ne[0];
+    const int64_t n_rows = ggml_nrows(dst);
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const int64_t i1 = r % dst->ne[1];
+        const int64_t i2 = (r/dst->ne[1]) % dst->ne[2];
+        const int64_t i3 = r/(dst->ne[1]*dst->ne[2]);
+        const float * g = (const float *) ((const char *) gu->data + i1*gu->nb[1] + i2*gu->nb[2] + i3*gu->nb[3]);
+        const float * u = g + n_ff;
+        float * y = (float *) dst->data + r*n_ff;
+        for (int64_t i = 0; i < n_ff; ++i) {
+            const float act = beta*tanhf(g[i]/beta)*(1.0f/(1.0f + expf(-g[i])));
+            const float up  = lb > 0.0f ? lb*tanhf(u[i]/lb) : u[i];
+            y[i] = act*up;
+        }
+    }
+}
+
+static void ggml_inkling_relbias_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * w     = dst->src[0];
+    const ggml_tensor * sinks = dst->src[1];
+    const ggml_tensor * rel   = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * r     = dst->src[4];
+    const int64_t n_rel  = w->ne[0];
+    const int64_t n_ext  = w->ne[1];
+    const int64_t n_head = r->ne[1];
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t T_s    = dst->ne[1];
+    const int64_t n_str  = dst->ne[3];
+    const int64_t n_rows = T_s*n_head*n_str;
+    for (int64_t row = params->ith; row < n_rows; row += params->nth) {
+        const int64_t t = row % T_s;
+        const int64_t h = (row/T_s) % n_head;
+        const int64_t s = row/(T_s*n_head);
+        const int64_t tg = s*T_s + t;
+        const float sink = ((const float *) sinks->data)[tg*n_head + h];
+        const float * rv = (const float *) r->data + (tg*n_head + h)*n_rel;
+        const int32_t * rp = (const int32_t *) rel->data + tg*n_kv;
+        const char * mrow = (const char *) mask->data + t*mask->nb[1] + s*mask->nb[3];
+        char * drow = (char *) dst->data + t*dst->nb[1] + h*dst->nb[2] + s*dst->nb[3];
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const float m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mrow)[j]) : ((const float *) mrow)[j];
+            float b = 0.0f;
+            if (rp[j] < n_ext) {
+                const float * wc = (const float *) w->data + (int64_t) rp[j]*n_rel;
+                for (int64_t k = 0; k < n_rel; ++k) b += wc[k]*rv[k];
+            }
+            const float v = m + b - sink;
+            if (dst->type == GGML_TYPE_F16) ((ggml_fp16_t *) drow)[j] = GGML_CPU_FP32_TO_FP16(v);
+            else                            ((float *) drow)[j] = v;
+        }
+    }
+}
+
+static void ggml_inkling_ctrl_down_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur = dst->src[0];
+    const ggml_tensor * msg = dst->src[1];
+    const ggml_tensor * D   = dst->src[2];
+    const float eps = ggml_get_op_params_f32(dst, 1);
+    const int64_t n = cur->ne[0];
+    const int64_t T = ggml_nelements(cur)/n;
+    const int64_t rank = D->ne[1];
+    for (int64_t t = 0; t < T; ++t) {
+        const float * c = (const float *) cur->data + t*n;
+        const float * m = (const float *) msg->data + t*n;
+        double sc = 0, sm = 0;
+        for (int64_t i = 0; i < n; ++i) { sc += (double) c[i]*c[i]; sm += (double) m[i]*m[i]; }
+        const float rc = 1.0f/sqrtf((float) (sc/n) + eps);
+        const float rm = 1.0f/sqrtf((float) (sm/n) + eps);
+        for (int64_t k = params->ith; k < rank; k += params->nth) {
+            const float * d = (const float *) D->data + k*2*n;
+            float ac = 0, am = 0;
+            for (int64_t i = 0; i < n; ++i) { ac += d[i]*c[i]; am += d[n + i]*m[i]; }
+            ((float *) dst->data)[t*rank + k] = ac*rc + am*rm;
+        }
+    }
+}
+
+static void ggml_inkling_ctrl_gate_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * cur = dst->src[0];
+    const ggml_tensor * msg = dst->src[1];
+    const ggml_tensor * hh  = dst->src[2];
+    const ggml_tensor * F   = dst->src[3];
+    const ggml_tensor * G   = dst->src[4];
+    const int64_t n = cur->ne[0];
+    const int64_t T = ggml_nelements(cur)/n;
+    const int64_t rank = hh->ne[0];
+    for (int64_t t = 0; t < T; ++t) {
+        const float * h = (const float *) hh->data + t*rank;
+        for (int64_t i = params->ith; i < n; i += params->nth) {
+            const float * f = (const float *) F->data + i*rank;
+            const float * g = (const float *) G->data + i*rank;
+            float af = 0, ag = 0;
+            for (int64_t k = 0; k < rank; ++k) { af += f[k]*h[k]; ag += g[k]*h[k]; }
+            const float c = ((const float *) cur->data)[t*n + i];
+            const float m = ((const float *) msg->data)[t*n + i];
+            ((float *) dst->data)[t*n + i] = (1.0f - tanhf(af))*c + tanhf(ag)*m;
+        }
+    }
+}
+
+static void ggml_inkling_conv_state_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * past = dst->src[0];
+    const ggml_tensor * w    = dst->src[1];
+    const ggml_tensor * dyn  = dst->src[2];
+    const ggml_tensor * cur  = dst->src[3];
+    const ggml_tensor * sd   = dst->src[4];
+    const float out_scale = ggml_get_op_params_f32(dst, 1);
+    const int64_t K = w->ne[0];
+    const int64_t C = w->ne[1];
+    const int64_t S = past->ne[2];
+    const int64_t T = dst->ne[1];
+    const int64_t n_t = T/S;
+    const int64_t H = dyn ? dyn->ne[0]/K : 0;
+    const int64_t cph = H ? C/H : 1;
+    std::vector<float> x(K - 1 + n_t);
+    for (int64_t c = params->ith; c < C; c += params->nth) {
+        const float * wc = (const float *) w->data + c*K;
+        for (int64_t s = 0; s < S; ++s) {
+            const float * pc = (const float *) ((const char *) past->data + c*past->nb[1] + s*past->nb[2]);
+            for (int64_t i = 0; i < K - 1; ++i) x[i] = pc[i];
+            for (int64_t t = 0; t < n_t; ++t) x[K - 1 + t] = ((const float *) cur->data)[(s*n_t + t)*C + c];
+            for (int64_t t = 0; t < n_t; ++t) {
+                const int64_t tg = s*n_t + t;
+                float acc = x[t + K - 1];
+                for (int64_t k = 0; k < K; ++k) acc += wc[k]*x[t + k];
+                if (dyn) {
+                    const float * dt = (const float *) dyn->data + tg*dyn->ne[0] + (c/cph)*K;
+                    for (int64_t lag = 0; lag < K; ++lag) acc += dt[lag]*x[t + K - 1 - lag];
+                }
+                ((float *) dst->data)[tg*C + c] = acc*out_scale;
+            }
+            if (sd) {
+                float * st = (float *) ((char *) sd->data + s*sd->nb[1]) + c*(K - 1);
+                for (int64_t i = 0; i < K - 1; ++i) st[i] = x[n_t + i];
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tensor * dst) {
     switch ((enum ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
         case GGML_INKLING_CLIP:    ggml_inkling_clip_f32   (params, dst); break;
@@ -11516,6 +11660,11 @@ void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tenso
         case GGML_INKLING_CONV:    ggml_inkling_conv_f32   (params, dst); break;
         case GGML_INKLING_GATE:    ggml_inkling_gate_f32   (params, dst); break;
         case GGML_INKLING_RELMASK: ggml_inkling_relmask_f32(params, dst); break;
+        case GGML_INKLING_SITU:    ggml_inkling_situ_f32   (params, dst); break;
+        case GGML_INKLING_RELBIAS: ggml_inkling_relbias_f32(params, dst); break;
+        case GGML_INKLING_CTRL_DOWN: ggml_inkling_ctrl_down_f32(params, dst); break;
+        case GGML_INKLING_CTRL_GATE: ggml_inkling_ctrl_gate_f32(params, dst); break;
+        case GGML_INKLING_CONV_STATE: ggml_inkling_conv_state_f32(params, dst); break;
         default: GGML_ABORT("unknown inkling op");
     }
 }

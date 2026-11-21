@@ -1,0 +1,52 @@
+#version 450
+
+// Inkling 2 short conv reading the history and the input directly; the thread of the last token of a sequence writes
+// the new conv state (the last K-1 inputs of the channel). x(i) = i < K-1 ? past[i] : cur[i - (K-1)]
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter {
+    uint C; uint K; uint n_t; uint n_s; uint p_nb1; uint p_nb2; uint H; uint s_row; uint has_state; float out_scale;
+} p;
+
+layout (binding = 0) readonly  buffer PAST {float data_p[];};
+layout (binding = 1) readonly  buffer W    {float data_w[];};
+layout (binding = 2) readonly  buffer DYN  {float data_dyn[];};
+layout (binding = 3) readonly  buffer CUR  {float data_c[];};
+layout (binding = 4)           buffer ST   {float data_st[];};
+layout (binding = 5) writeonly buffer D    {float data_d[];};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+float xv(uint c, uint s, uint i) {
+    return i < p.K - 1 ? data_p[c*p.p_nb1 + s*p.p_nb2 + i] : data_c[(s*p.n_t + i - (p.K - 1))*p.C + c];
+}
+
+void main() {
+    const uint c  = gl_GlobalInvocationID.x;
+    const uint tg = gl_WorkGroupID.y + gl_WorkGroupID.z*65535;
+    if (c >= p.C || tg >= p.n_t*p.n_s) {
+        return;
+    }
+    const uint s = tg/p.n_t;
+    const uint t = tg%p.n_t;
+
+    float acc = xv(c, s, t + p.K - 1);
+    for (uint k = 0; k < p.K; ++k) {
+        acc += data_w[c*p.K + k]*xv(c, s, t + k);
+    }
+    if (p.H != 0) {
+        const uint h  = c/(p.C/p.H);
+        const uint db = tg*p.K*p.H + h*p.K;
+        for (uint lag = 0; lag < p.K; ++lag) {
+            acc += data_dyn[db + lag]*xv(c, s, t + p.K - 1 - lag);
+        }
+    }
+    data_d[tg*p.C + c] = acc*p.out_scale;
+
+    if (p.has_state != 0 && t == p.n_t - 1) {
+        for (uint i = 0; i < p.K - 1; ++i) {
+            data_st[s*p.s_row + c*(p.K - 1) + i] = xv(c, s, p.n_t + i);
+        }
+    }
+}

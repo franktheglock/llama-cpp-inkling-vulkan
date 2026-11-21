@@ -1,0 +1,56 @@
+#version 450
+
+// Inkling 2 relative-position mask with the bias computed in place:
+// out[j, t, h, s] = mask[j, t, s] + (rp < n_ext ? sum_k W[k, rp]*R[k, h, tg] : 0) - sinks[h, tg], rp = rel[j, tg]
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter {
+    uint n_kv; uint T_s; uint n_head; uint n_str; uint n_ext; uint n_rel;
+    uint m_nb1; uint m_nb3; uint n_rows;
+} p;
+
+layout (binding = 0) readonly  buffer W   {float data_w[];};
+layout (binding = 1) readonly  buffer SK  {float data_sk[];};
+layout (binding = 2) readonly  buffer RP  {int   data_rp[];};
+layout (binding = 3) readonly  buffer M   {MASK_TYPE data_m[];};
+layout (binding = 4) readonly  buffer R   {float data_r[];};
+layout (binding = 5) writeonly buffer D   {D_TYPE data_d[];};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define REL_MAX 32
+shared float rsh[REL_MAX];
+
+void main() {
+    const uint j   = gl_GlobalInvocationID.x;
+    const uint row = gl_WorkGroupID.y + gl_WorkGroupID.z*65535;
+    if (row >= p.n_rows) {
+        return;
+    }
+    const uint t  = row % p.T_s;
+    const uint h  = (row/p.T_s) % p.n_head;
+    const uint s  = row/(p.T_s*p.n_head);
+    const uint tg = s*p.T_s + t;
+
+    if (gl_LocalInvocationID.x < p.n_rel) {
+        rsh[gl_LocalInvocationID.x] = data_r[(tg*p.n_head + h)*p.n_rel + gl_LocalInvocationID.x];
+    }
+    barrier();
+    if (j >= p.n_kv) {
+        return;
+    }
+
+    const uint  rp = uint(data_rp[tg*p.n_kv + j]);
+    float b = 0.0;
+    if (rp < p.n_ext) {
+        const uint wb = rp*p.n_rel;
+        for (uint k = 0; k < p.n_rel; ++k) {
+            b += data_w[wb + k]*rsh[k];
+        }
+    }
+    const float m = float(data_m[t*p.m_nb1 + s*p.m_nb3 + j]);
+    data_d[row*p.n_kv + j] = D_TYPE(m + b - data_sk[tg*p.n_head + h]);
+}
