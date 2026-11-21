@@ -412,13 +412,16 @@ struct common_sampler * common_sampler_init(
         llama_sampler_chain_add(chain, smpl);
     }
 
-    if (grmr && params.backend_sampling) {
+    // a lazy grammar does not constrain sampling until it is triggered, and an unlimited reasoning budget never
+    // forces tokens: both can start on the backend sampler, the caller switches to CPU sampling once they become
+    // active (see common_sampler_can_use_backend())
+    if (grmr && params.backend_sampling && !params.grammar_lazy) {
         LOG_WRN("%s: backend sampling is not compatible with grammar, disabling\n", __func__);
 
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
+    if (rbudget && params.backend_sampling && !(params.reasoning_budget_tokens < 0 && !params.reasoning_control)) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
 
         params.backend_sampling = false;
@@ -572,7 +575,17 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 bool common_sampler_can_use_backend(const struct common_sampler * gsmpl) {
-    return gsmpl != nullptr && gsmpl->grmr == nullptr && gsmpl->rbudget == nullptr;
+    if (gsmpl == nullptr) {
+        return false;
+    }
+    // a lazy grammar is passive until its trigger fires
+    const bool grammar_ok = gsmpl->grmr == nullptr ||
+        (gsmpl->params.grammar_lazy && llama_sampler_grammar_is_awaiting_trigger(gsmpl->grmr));
+    // an unlimited reasoning budget never forces tokens
+    const bool budget_ok = gsmpl->rbudget == nullptr ||
+        (gsmpl->params.reasoning_budget_tokens < 0 && !gsmpl->params.reasoning_control &&
+         common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING);
+    return grammar_ok && budget_ok;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
@@ -598,8 +611,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            GGML_ASSERT(common_sampler_can_use_backend(gsmpl) &&
+                        "an active grammar or reasoning budget cannot be used with backend sampling");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -675,6 +688,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         if (draft[i] != id) {
             break;
+        }
+
+        // the backend sampled the next positions without the grammar: once this token triggers it (or a reasoning
+        // budget starts forcing), stop here so they are re-sampled on the CPU (the caller drops the rest like a
+        // rejected draft, and re-feeds the last token)
+        const bool next_on_backend =
+            llama_get_sampled_token_ith(ctx, idxs[i + 1]) != LLAMA_TOKEN_NULL ||
+            llama_get_sampled_probs_ith(ctx, idxs[i + 1]) != nullptr ||
+            llama_get_sampled_logits_ith(ctx, idxs[i + 1]) != nullptr;
+        if (next_on_backend && !common_sampler_can_use_backend(gsmpl)) {
+            return result;
         }
     }
 

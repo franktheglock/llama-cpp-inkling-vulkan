@@ -487,6 +487,7 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    bool smpl_on_backend = false; // the slot's sampler chain is set on ctx_tgt (backend sampling)
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -549,6 +550,7 @@ struct server_slot {
         task.reset();
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        smpl_on_backend = false;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -2046,6 +2048,16 @@ private:
         return output;
     }
 
+    // a lazy grammar / unlimited reasoning budget starts on the backend sampler; once it becomes active, the slot
+    // must sample on the CPU from its next decode on
+    void sync_backend_sampler(server_slot & slot) {
+        if (slot.smpl_on_backend && !common_sampler_can_use_backend(slot.smpl.get())) {
+            SLT_DBG(slot, "%s", "grammar/reasoning budget became active, switching to CPU sampling\n");
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            slot.smpl_on_backend = false;
+        }
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -2147,6 +2159,7 @@ private:
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+            slot.smpl_on_backend = backend_sampling;
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -4272,6 +4285,7 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+            sync_backend_sampler(slot);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -4329,6 +4343,7 @@ private:
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
+                sync_backend_sampler(slot);
 
                 GGML_ASSERT(accepted.size() >= 1);
 

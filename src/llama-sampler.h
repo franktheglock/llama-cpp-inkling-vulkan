@@ -15,6 +15,9 @@ struct llama_sampler_chain {
     // has .backend_init() been called?
     bool is_init = false;
 
+    // is the chain currently attached to a context for backend sampling?
+    bool is_attached = false;
+
     struct info {
         bool is_backend;
 
@@ -32,6 +35,8 @@ struct llama_sampler_chain {
 
     mutable int32_t n_sample;
 };
+
+void llama_sampler_chain_detach(struct llama_sampler * smpl);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,

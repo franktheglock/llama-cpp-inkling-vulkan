@@ -648,7 +648,7 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
-    bool is_backend = chain->is_init;
+    bool is_backend = chain->is_init && chain->is_attached;
 
     for (auto & smpl : chain->samplers) {
         if (is_backend && smpl.is_backend) {
@@ -700,9 +700,18 @@ static bool llama_sampler_chain_backend_init(
         ggml_backend_buffer_type_t   buft) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    GGML_ASSERT(chain->is_init == false && "llama_sampler_chain_backend_init() called twice");
+    if (chain->is_init) {
+        chain->is_attached = true;
 
-    chain->is_init = true;
+        bool res = true;
+        for (const auto & s : chain->samplers) {
+            res = res && s.is_backend;
+        }
+        return res;
+    }
+
+    chain->is_init     = true;
+    chain->is_attached = true;
 
     bool res = true;
 
@@ -753,7 +762,7 @@ static void llama_sampler_chain_backend_apply(
           struct llama_sampler_data * data) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
+    GGML_ASSERT(chain->is_init && chain->is_attached && "llama_sampler_chain_backend_init() not called");
 
     for (auto & smpl : chain->samplers) {
         if (!smpl.is_backend) {
@@ -799,12 +808,22 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
         /* .ctx   = */ new llama_sampler_chain {
             /* .params      = */ params,
             /* .is_init     = */ false,
+            /* .is_attached = */ false,
             /* .samplers    = */ {},
             /* .cur         = */ {},
             /* .t_sample_us = */ 0,
             /* .n_sample    = */ 0,
         }
     );
+}
+
+void llama_sampler_chain_detach(struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_chain_i) {
+        return;
+    }
+
+    auto * chain = (llama_sampler_chain *) smpl->ctx;
+    chain->is_attached = false;
 }
 
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
@@ -2555,6 +2574,14 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
 };
+
+bool llama_sampler_grammar_is_awaiting_trigger(const struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    return ctx->grammar != nullptr && ctx->grammar->awaiting_trigger;
+}
 
 static struct llama_sampler * llama_sampler_init_grammar_impl(
         const struct llama_vocab * vocab,
