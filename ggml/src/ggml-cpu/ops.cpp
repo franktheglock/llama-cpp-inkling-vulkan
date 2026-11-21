@@ -11686,6 +11686,67 @@ static void ggml_inkling_moe_sum_f32(const ggml_compute_params * params, ggml_te
     }
 }
 
+static void ggml_inkling_mix_part_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * query = dst->src[0];
+    const ggml_tensor * cur   = dst->src[1];
+    const int n_blocks = ggml_get_op_params_i32(dst, 2);
+    const int nq       = ggml_get_op_params_i32(dst, 3);
+    const int64_t n_embd = cur->ne[0];
+    const int64_t n_chunks = dst->ne[1], T = dst->ne[2];
+    for (int64_t r = params->ith; r < n_chunks*T; r += params->nth) {
+        const int64_t ch = r % n_chunks, t = r / n_chunks;
+        float * out = (float *) dst->data + r*45;
+        for (int j = 0; j < 45; ++j) out[j] = 0.0f;
+        for (int s = 0; s <= n_blocks; ++s) {
+            const ggml_tensor * src = s < n_blocks ? dst->src[2 + s] : cur;
+            const float * sv = (const float *) src->data + t*n_embd;
+            for (int64_t e = ch*256; e < std::min<int64_t>(n_embd, ch*256 + 256); ++e) {
+                out[s*5] += sv[e]*sv[e];
+                for (int q = 0; q < nq; ++q) {
+                    out[s*5 + 1 + q] += sv[e]*((const float *) ((const char *) query->data + q*query->nb[1]))[e];
+                }
+            }
+        }
+    }
+}
+
+static void ggml_inkling_mix_apply_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * part = dst->src[0];
+    const ggml_tensor * cur  = dst->src[1];
+    const float eps    = ggml_get_op_params_f32(dst, 1);
+    const int n_blocks = ggml_get_op_params_i32(dst, 2);
+    const int n_st     = n_blocks + 1;
+    const int64_t n_embd = dst->ne[0], T = dst->ne[1], nq = dst->ne[2];
+    const int64_t n_chunks = part->ne[1];
+    for (int64_t t = 0; t < T; ++t) {
+        float red[45] = {0};
+        for (int64_t ch = 0; ch < n_chunks; ++ch) {
+            for (int j = 0; j < 45; ++j) red[j] += ((const float *) part->data)[(t*n_chunks + ch)*45 + j];
+        }
+        float w[9][4] = {{0}};
+        for (int q = 0; q < nq; ++q) {
+            float mx = -INFINITY, sum = 0.0f, rinv[9];
+            for (int s = 0; s < n_st; ++s) {
+                rinv[s] = 1.0f/sqrtf(red[s*5]/n_embd + eps);
+                w[s][q] = red[s*5 + 1 + q]*rinv[s]/sqrtf((float) n_embd);
+                mx = std::max(mx, w[s][q]);
+            }
+            for (int s = 0; s < n_st; ++s) { w[s][q] = expf(w[s][q] - mx); sum += w[s][q]; }
+            for (int s = 0; s < n_st; ++s) { w[s][q] = w[s][q]/sum*rinv[s]; }
+        }
+        for (int64_t e = params->ith; e < n_embd; e += params->nth) {
+            for (int q = 0; q < nq; ++q) {
+                float acc = 0.0f;
+                for (int s = 0; s < n_st; ++s) {
+                    const ggml_tensor * src = s < n_blocks ? dst->src[2 + s] : cur;
+                    acc += w[s][q]*((const float *) src->data)[t*n_embd + e];
+                }
+                ((float *) dst->data)[(q*T + t)*n_embd + e] = acc;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tensor * dst) {
     switch ((enum ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
         case GGML_INKLING_CLIP:    ggml_inkling_clip_f32   (params, dst); break;
@@ -11699,6 +11760,8 @@ void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tenso
         case GGML_INKLING_CTRL_GATE: ggml_inkling_ctrl_gate_f32(params, dst); break;
         case GGML_INKLING_CONV_STATE: ggml_inkling_conv_state_f32(params, dst); break;
         case GGML_INKLING_MOE_SUM: ggml_inkling_moe_sum_f32(params, dst); break;
+        case GGML_INKLING_MIX_PART:  ggml_inkling_mix_part_f32 (params, dst); break;
+        case GGML_INKLING_MIX_APPLY: ggml_inkling_mix_apply_f32(params, dst); break;
         default: GGML_ABORT("unknown inkling op");
     }
 }

@@ -6703,6 +6703,38 @@ struct ggml_tensor * ggml_inkling_moe_sum(
     return result;
 }
 
+struct ggml_tensor * ggml_inkling_mix2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor ** blocks,
+        int                   n_blocks,
+        float                 eps) {
+    // validation and output shape from the one-pass constructor
+    struct ggml_tensor * ref = ggml_inkling_mix(ctx, query, cur, blocks, n_blocks, eps);
+    const int64_t n_embd = ref->ne[0], T = ref->ne[1], nq = ref->ne[2];
+    GGML_ASSERT(nq <= 4);
+    const int64_t n_chunks = (n_embd + 255)/256;
+    struct ggml_tensor * part = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 45, n_chunks, T);
+    ggml_set_op_params_i32(part, 0, GGML_INKLING_MIX_PART);
+    ggml_set_op_params_i32(part, 2, n_blocks);
+    ggml_set_op_params_i32(part, 3, (int32_t) nq);
+    part->op = GGML_OP_INKLING;
+    part->src[0] = query;
+    part->src[1] = cur;
+    for (int i = 0; i < n_blocks; ++i) part->src[2 + i] = blocks[i];
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, T, nq);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_MIX_APPLY);
+    ggml_set_op_params_f32(result, 1, eps);
+    ggml_set_op_params_i32(result, 2, n_blocks);
+    result->op = GGML_OP_INKLING;
+    result->src[0] = part;
+    result->src[1] = cur;
+    for (int i = 0; i < n_blocks; ++i) result->src[2 + i] = blocks[i];
+    return result;
+}
+
 // ggml_turbo_wht
 
 struct ggml_tensor * ggml_turbo_wht(

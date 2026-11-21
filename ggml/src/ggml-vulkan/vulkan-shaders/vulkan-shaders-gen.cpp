@@ -1298,6 +1298,8 @@ void process_shaders() {
     string_to_spv("lfm2_router_f32", "lfm2_router.comp", {});
     string_to_spv("inkling_clip_f32", "inkling_clip.comp", {});
     string_to_spv("inkling_mix_f32",  "inkling_mix.comp",  {});
+    string_to_spv("inkling_mix_part_f32",  "inkling_mix_part.comp",  {});
+    string_to_spv("inkling_mix_apply_f32", "inkling_mix_apply.comp", {});
     string_to_spv("inkling_conv_f32", "inkling_conv.comp", {});
     string_to_spv("inkling_gate_f32", "inkling_gate.comp", {});
     string_to_spv("inkling_situ_f32", "inkling_situ.comp", {});

@@ -2659,6 +2659,14 @@ struct test_inkling : public test_case {
                 }
                 return ggml_inkling_situ(ctx, gu, 1.5f, (extra & 1) ? 2.0f : 0.0f);
             }
+            case 11: {
+                const int nb = extra/8, nq = extra%8;
+                ggml_tensor * q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, nq);
+                ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                ggml_tensor * blocks[8];
+                for (int i = 0; i < nb; ++i) blocks[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, T);
+                return ggml_inkling_mix2(ctx, q, c, blocks, nb, 1e-6f);
+            }
             case 10: {
                 ggml_tensor * y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, T);
                 ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, b, T);
@@ -9106,6 +9114,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 2));
         test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 3));
         test_cases.emplace_back(new test_inkling(10, 2304, 8, T, 0));
+        for (int nb : {0, 1, 4, 8}) for (int nq : {1, 2, 3}) test_cases.emplace_back(new test_inkling(11, 2304, 0, T, nb*8 + nq));
         test_cases.emplace_back(new test_inkling(10, 2304, 8, T, 1));
         for (int e : {0, 1, 2, 3}) {
             test_cases.emplace_back(new test_inkling(GGML_INKLING_RELMASK, 256, 24, T, e));
@@ -10964,11 +10973,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     for (int nb : {0, 1, 2, 4}) {
+        test_cases.emplace_back(new test_inkling(11, 2304, 0, 1, nb*8 + 1));
         test_cases.emplace_back(new test_inkling(GGML_INKLING_MIX, 2304, 0, 1, nb*8 + 1));
     }
     test_cases.emplace_back(new test_inkling(GGML_INKLING_CLIP, 128, 24, 1, 6));
     test_cases.emplace_back(new test_inkling(GGML_INKLING_CONV, 1024, 1, 1, 0));
     test_cases.emplace_back(new test_inkling(GGML_INKLING_GATE, 2304, 0, 1, 0));
+    test_cases.emplace_back(new test_inkling(8, 2304, 64, 1, 0));
+    test_cases.emplace_back(new test_inkling(7, 2304, 64, 1, 0));
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {2304, 1, 1, 1}));
 
 

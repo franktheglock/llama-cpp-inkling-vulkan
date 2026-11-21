@@ -2649,6 +2649,8 @@ extern "C" {
         GGML_INKLING_RELBIAS = 6, // like RELMASK, the bias computed from the rel_bias weight and r: sum_r w[r, rel_pos]*r[r, h, t]
         GGML_INKLING_CTRL_DOWN = 7, // h = D [rms(cur); rms(msg)]
         GGML_INKLING_CTRL_GATE = 8, // (1 - tanh(F h))*cur + tanh(G h)*msg
+        GGML_INKLING_MIX_PART  = 11, // per 256-element chunk: sum of squares and query dots of every state -> [45, n_chunks, T]
+        GGML_INKLING_MIX_APPLY = 12, // softmax weights from the partials, weighted sum of the normalized states
         GGML_INKLING_MOE_SUM  = 10, // out[:, t] = sum_e w[e, t]*scale[ids[e, t]]*y[:, e, t]
         GGML_INKLING_CONV_STATE = 9, // CONV reading the history and the input directly, writing the new conv state
         GGML_INKLING_SITU    = 5, // MoE SITU on a merged [gate | up] row: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
@@ -2754,6 +2756,15 @@ extern "C" {
             struct ggml_tensor  * scale,
             float                 beta,
             float                 linear_beta);
+
+    // two-pass ggml_inkling_mix (same result): partial reductions over 256-element chunks, then the weighted sum
+    GGML_API struct ggml_tensor * ggml_inkling_mix2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor ** blocks,
+            int                   n_blocks,
+            float                 eps);
 
     // y: [n, n_used, T] f32 contiguous; w: [1, n_used, T] f32; ids: [n_used, T] i32 or NULL; scale: [n_expert] f32 or NULL
     GGML_API struct ggml_tensor * ggml_inkling_moe_sum(

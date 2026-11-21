@@ -1,0 +1,90 @@
+#version 450
+
+// Inkling 2 depth mix, pass 2: fold the chunk partials of token t, softmax over the states per query,
+// write this workgroup's 256-element chunk of out[:, t, q] = sum_s w[s, q]*rinv[s]*state_s
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter { uint n_embd; uint T; uint nq; uint n_blocks; uint q_stride; uint n_chunks; float eps; } p;
+
+layout (binding = 0)  readonly  buffer PT  {float data_pt[];};
+layout (binding = 1)  readonly  buffer C   {float data_c[];};
+layout (binding = 2)  readonly  buffer B0  {float data_b0[];};
+layout (binding = 3)  readonly  buffer B1  {float data_b1[];};
+layout (binding = 4)  readonly  buffer B2  {float data_b2[];};
+layout (binding = 5)  readonly  buffer B3  {float data_b3[];};
+layout (binding = 6)  readonly  buffer B4  {float data_b4[];};
+layout (binding = 7)  readonly  buffer B5  {float data_b5[];};
+layout (binding = 8)  readonly  buffer B6  {float data_b6[];};
+layout (binding = 9)  readonly  buffer B7  {float data_b7[];};
+
+float st(uint s, uint idx) {
+    if (s == p.n_blocks) { return data_c[idx]; }
+    if (s == 0) { return data_b0[idx]; }
+    if (s == 1) { return data_b1[idx]; }
+    if (s == 2) { return data_b2[idx]; }
+    if (s == 3) { return data_b3[idx]; }
+    if (s == 4) { return data_b4[idx]; }
+    if (s == 5) { return data_b5[idx]; }
+    if (s == 6) { return data_b6[idx]; }
+    return data_b7[idx];
+}
+layout (binding = 10) writeonly buffer D   {float data_d[];};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float red[45];
+shared vec4  wsh[9];
+
+void main() {
+    const uint ch  = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n_st = p.n_blocks + 1;
+
+    if (tid < 45) {
+        float a = 0.0;
+        for (uint c = 0; c < p.n_chunks; ++c) {
+            a += data_pt[(t*p.n_chunks + c)*45 + tid];
+        }
+        red[tid] = a;
+    }
+    barrier();
+    if (tid == 0) {
+        const float kscale = inversesqrt(float(p.n_embd));
+        float rinv[9];
+        vec4  w[9];
+        vec4  mx = vec4(-1.0/0.0);
+        [[unroll]] for (uint s = 0; s < 9; ++s) {
+            rinv[s] = inversesqrt(red[s*5]/float(p.n_embd) + p.eps);
+            w[s] = vec4(red[s*5 + 1], red[s*5 + 2], red[s*5 + 3], red[s*5 + 4])*(rinv[s]*kscale);
+            if (s < n_st) { mx = max(mx, w[s]); }
+        }
+        vec4 sum = vec4(0.0);
+        [[unroll]] for (uint s = 0; s < 9; ++s) {
+            w[s] = s < n_st ? exp(w[s] - mx) : vec4(0.0);
+            sum += w[s];
+        }
+        [[unroll]] for (uint s = 0; s < 9; ++s) {
+            wsh[s] = w[s]/sum*rinv[s];
+        }
+    }
+    barrier();
+
+    const uint e = ch*256 + tid;
+    if (e >= p.n_embd) {
+        return;
+    }
+    vec4 acc = vec4(0.0);
+    [[unroll]] for (uint s = 0; s < 9; ++s) {
+        if (s < n_st) {
+            acc += wsh[s]*st(s, t*p.n_embd + e);
+        }
+    }
+    const uint o = t*p.n_embd + e;
+    const uint q_step = p.T*p.n_embd;
+    data_d[o] = acc.x;
+    if (p.nq > 1) { data_d[o + q_step]   = acc.y; }
+    if (p.nq > 2) { data_d[o + 2*q_step] = acc.z; }
+    if (p.nq > 3) { data_d[o + 3*q_step] = acc.w; }
+}

@@ -1,0 +1,76 @@
+#version 450
+
+// Inkling 2 depth mix, pass 1: per 256-element chunk of token t, for every state s the sum of squares and the dots
+// with the queries -> part[(t*n_chunks + chunk)*45 + s*5 + {0: ss, 1..4: dot q}]
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameter { uint n_embd; uint T; uint nq; uint n_blocks; uint q_stride; uint n_chunks; float eps; } p;
+
+layout (binding = 0)  readonly  buffer Q   {float data_q[];};
+layout (binding = 1)  readonly  buffer C   {float data_c[];};
+layout (binding = 2)  readonly  buffer B0  {float data_b0[];};
+layout (binding = 3)  readonly  buffer B1  {float data_b1[];};
+layout (binding = 4)  readonly  buffer B2  {float data_b2[];};
+layout (binding = 5)  readonly  buffer B3  {float data_b3[];};
+layout (binding = 6)  readonly  buffer B4  {float data_b4[];};
+layout (binding = 7)  readonly  buffer B5  {float data_b5[];};
+layout (binding = 8)  readonly  buffer B6  {float data_b6[];};
+layout (binding = 9)  readonly  buffer B7  {float data_b7[];};
+
+float st(uint s, uint idx) {
+    if (s == p.n_blocks) { return data_c[idx]; }
+    if (s == 0) { return data_b0[idx]; }
+    if (s == 1) { return data_b1[idx]; }
+    if (s == 2) { return data_b2[idx]; }
+    if (s == 3) { return data_b3[idx]; }
+    if (s == 4) { return data_b4[idx]; }
+    if (s == 5) { return data_b5[idx]; }
+    if (s == 6) { return data_b6[idx]; }
+    return data_b7[idx];
+}
+layout (binding = 10) writeonly buffer D   {float data_d[];};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float red[8][45];
+
+void main() {
+    const uint ch  = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint e   = ch*256 + tid;
+    const bool ok  = e < p.n_embd;
+    const uint n_st = p.n_blocks + 1;
+
+    vec4 qv = vec4(0.0);
+    if (ok) {
+        qv = vec4(p.nq > 0 ? data_q[e] : 0.0, p.nq > 1 ? data_q[p.q_stride + e] : 0.0,
+                  p.nq > 2 ? data_q[2*p.q_stride + e] : 0.0, p.nq > 3 ? data_q[3*p.q_stride + e] : 0.0);
+    }
+    [[unroll]] for (uint s = 0; s < 9; ++s) {
+        float v = 0.0;
+        if (ok && s < n_st) {
+            v = st(s, t*p.n_embd + e);
+        }
+        float ss = subgroupAdd(v*v);
+        vec4  dq = subgroupAdd(v*qv);
+        if (gl_SubgroupInvocationID == 0) {
+            red[gl_SubgroupID][s*5 + 0] = ss;
+            red[gl_SubgroupID][s*5 + 1] = dq.x;
+            red[gl_SubgroupID][s*5 + 2] = dq.y;
+            red[gl_SubgroupID][s*5 + 3] = dq.z;
+            red[gl_SubgroupID][s*5 + 4] = dq.w;
+        }
+    }
+    barrier();
+    if (tid < 45) {
+        float a = 0.0;
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            a += red[g][tid];
+        }
+        data_d[(t*p.n_chunks + ch)*45 + tid] = a;
+    }
+}

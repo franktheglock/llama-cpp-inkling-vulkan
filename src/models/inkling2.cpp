@@ -219,7 +219,7 @@ std::vector<ggml_tensor *> llama_model_inkling2::graph::mix_slices(const std::ve
     std::vector<ggml_tensor *> out(nq);
     if ((fused_mask & 2) && blocks.size() <= 8) {
         std::vector<ggml_tensor *> bl(blocks.begin(), blocks.end());
-        ggml_tensor * m = ggml_inkling_mix(ctx0, query, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), bl.data(), (int) bl.size(), 1e-6f);
+        ggml_tensor * m = ggml_inkling_mix2(ctx0, query, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), bl.data(), (int) bl.size(), 1e-6f);
         for (int64_t j = 0; j < nq; ++j) {
             out[j] = ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[1], j*m->nb[2]);
         }
