@@ -6667,6 +6667,42 @@ struct ggml_tensor * ggml_inkling_situ(
     return result;
 }
 
+struct ggml_tensor * ggml_inkling_situ_scaled(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate_up,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * scale,
+        float                 beta,
+        float                 linear_beta) {
+    struct ggml_tensor * result = ggml_inkling_situ(ctx, gate_up, beta, linear_beta);
+    if (scale) {
+        GGML_ASSERT(ids && ids->type == GGML_TYPE_I32 && ids->ne[0] == gate_up->ne[1] && ids->ne[1] == gate_up->ne[2]);
+        GGML_ASSERT(scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale));
+        result->src[1] = ids;
+        result->src[2] = scale;
+    }
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_moe_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * y,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * scale) {
+    GGML_ASSERT(y->type == GGML_TYPE_F32 && ggml_is_contiguous(y) && y->ne[3] == 1);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == y->ne[1]*y->ne[2]);
+    GGML_ASSERT(!scale || (ids && ids->type == GGML_TYPE_I32 && ids->ne[0] == y->ne[1] && ids->ne[1] == y->ne[2] && scale->type == GGML_TYPE_F32));
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, y->ne[0], y->ne[2]);
+    ggml_set_op_params_i32(result, 0, GGML_INKLING_MOE_SUM);
+    result->op     = GGML_OP_INKLING;
+    result->src[0] = y;
+    result->src[1] = w;
+    result->src[2] = scale ? ids : NULL;
+    result->src[3] = scale;
+    return result;
+}
+
 // ggml_turbo_wht
 
 struct ggml_tensor * ggml_turbo_wht(

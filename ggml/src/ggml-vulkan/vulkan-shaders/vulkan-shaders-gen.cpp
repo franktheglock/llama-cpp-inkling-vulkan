@@ -1301,6 +1301,7 @@ void process_shaders() {
     string_to_spv("inkling_conv_f32", "inkling_conv.comp", {});
     string_to_spv("inkling_gate_f32", "inkling_gate.comp", {});
     string_to_spv("inkling_situ_f32", "inkling_situ.comp", {});
+    string_to_spv("inkling_moe_sum_f32", "inkling_moe_sum.comp", {});
     string_to_spv("inkling_conv_state_f32", "inkling_conv_state.comp", {});
     string_to_spv("inkling_ctrl_down_f32", "inkling_ctrl_down.comp", {});
     string_to_spv("inkling_ctrl_gate_f32", "inkling_ctrl_gate.comp", {});

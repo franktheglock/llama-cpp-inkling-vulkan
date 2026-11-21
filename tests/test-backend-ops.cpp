@@ -2652,7 +2652,19 @@ struct test_inkling : public test_case {
             }
             case 5: {
                 ggml_tensor * gu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*a, b, T);
-                return ggml_inkling_situ(ctx, gu, 1.5f, extra ? 2.0f : 0.0f);
+                if (extra & 2) {
+                    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, b, T);
+                    ggml_tensor * sc  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 33);
+                    return ggml_inkling_situ_scaled(ctx, gu, ids, sc, 1.5f, (extra & 1) ? 2.0f : 0.0f);
+                }
+                return ggml_inkling_situ(ctx, gu, 1.5f, (extra & 1) ? 2.0f : 0.0f);
+            }
+            case 10: {
+                ggml_tensor * y = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, T);
+                ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, b, T);
+                ggml_tensor * ids = extra ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, b, T) : nullptr;
+                ggml_tensor * sc  = extra ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 33) : nullptr;
+                return ggml_inkling_moe_sum(ctx, y, w, ids, sc);
             }
             case GGML_INKLING_GATE: {
                 ggml_tensor * t[4];
@@ -9091,6 +9103,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_inkling(9, 2304, 2, T, 0));
         test_cases.emplace_back(new test_inkling(8, 2304, 64, T, 0));
         test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 1));
+        test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 2));
+        test_cases.emplace_back(new test_inkling(5, 1152, 8, T, 3));
+        test_cases.emplace_back(new test_inkling(10, 2304, 8, T, 0));
+        test_cases.emplace_back(new test_inkling(10, 2304, 8, T, 1));
         for (int e : {0, 1, 2, 3}) {
             test_cases.emplace_back(new test_inkling(GGML_INKLING_RELMASK, 256, 24, T, e));
         }

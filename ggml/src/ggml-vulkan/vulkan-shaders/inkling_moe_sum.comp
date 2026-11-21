@@ -1,0 +1,41 @@
+#version 450
+
+// Inkling 2 MoE combine: out[i, t] = sum_e w[e, t]*scale[ids[e, t]]*y[i, e, t]
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter { uint n; uint n_used; uint T; uint has_scale; uint ids_nb1; } p;
+
+layout (binding = 0) readonly  buffer Y  {float data_y[];};
+layout (binding = 1) readonly  buffer W  {float data_w[];};
+layout (binding = 2) readonly  buffer ID {int   data_ids[];};
+layout (binding = 3) readonly  buffer SC {float data_sc[];};
+layout (binding = 4) writeonly buffer D  {float data_d[];};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define NE_MAX 32
+shared float wsh[NE_MAX];
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y + gl_WorkGroupID.z*65535;
+    if (gl_LocalInvocationID.x < p.n_used) {
+        const uint e = gl_LocalInvocationID.x;
+        float w = data_w[t*p.n_used + e];
+        if (p.has_scale != 0) {
+            w *= data_sc[data_ids[t*p.ids_nb1 + e]];
+        }
+        wsh[e] = w;
+    }
+    barrier();
+    if (i >= p.n) {
+        return;
+    }
+    float acc = 0.0;
+    const uint yb = t*p.n_used*p.n + i;
+    for (uint e = 0; e < p.n_used; ++e) {
+        acc += wsh[e]*data_y[yb + e*p.n];
+    }
+    data_d[t*p.n + i] = acc;
+}

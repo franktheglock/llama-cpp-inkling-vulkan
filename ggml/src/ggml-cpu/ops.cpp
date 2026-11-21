@@ -11522,9 +11522,16 @@ static void ggml_inkling_situ_f32(const ggml_compute_params * params, ggml_tenso
         const float * g = (const float *) ((const char *) gu->data + i1*gu->nb[1] + i2*gu->nb[2] + i3*gu->nb[3]);
         const float * u = g + n_ff;
         float * y = (float *) dst->data + r*n_ff;
+        float sc = 1.0f;
+        if (dst->src[2]) {
+            const int32_t e = ((const int32_t *) ((const char *) dst->src[1]->data + i1*dst->src[1]->nb[0] + i2*dst->src[1]->nb[1]))[0];
+            sc = ((const float *) dst->src[2]->data)[e];
+        }
         for (int64_t i = 0; i < n_ff; ++i) {
-            const float act = beta*tanhf(g[i]/beta)*(1.0f/(1.0f + expf(-g[i])));
-            const float up  = lb > 0.0f ? lb*tanhf(u[i]/lb) : u[i];
+            const float gs  = g[i]*sc;
+            const float us  = u[i]*sc;
+            const float act = beta*tanhf(gs/beta)*(1.0f/(1.0f + expf(-gs)));
+            const float up  = lb > 0.0f ? lb*tanhf(us/lb) : us;
             y[i] = act*up;
         }
     }
@@ -11653,6 +11660,32 @@ static void ggml_inkling_conv_state_f32(const ggml_compute_params * params, ggml
     }
 }
 
+static void ggml_inkling_moe_sum_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * y   = dst->src[0];
+    const ggml_tensor * w   = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    const ggml_tensor * sc  = dst->src[3];
+    const int64_t n = y->ne[0], n_used = y->ne[1], T = y->ne[2];
+    for (int64_t t = 0; t < T; ++t) {
+        float we[64];
+        GGML_ASSERT(n_used <= 64);
+        for (int64_t e = 0; e < n_used; ++e) {
+            we[e] = ((const float *) w->data)[t*n_used + e];
+            if (sc) {
+                const int32_t id = *(const int32_t *) ((const char *) ids->data + e*ids->nb[0] + t*ids->nb[1]);
+                we[e] *= ((const float *) sc->data)[id];
+            }
+        }
+        for (int64_t i = params->ith; i < n; i += params->nth) {
+            float acc = 0.0f;
+            for (int64_t e = 0; e < n_used; ++e) {
+                acc += we[e]*((const float *) y->data)[(t*n_used + e)*n + i];
+            }
+            ((float *) dst->data)[t*n + i] = acc;
+        }
+    }
+}
+
 void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tensor * dst) {
     switch ((enum ggml_inkling_op) ggml_get_op_params_i32(dst, 0)) {
         case GGML_INKLING_CLIP:    ggml_inkling_clip_f32   (params, dst); break;
@@ -11665,6 +11698,7 @@ void ggml_compute_forward_inkling(const ggml_compute_params * params, ggml_tenso
         case GGML_INKLING_CTRL_DOWN: ggml_inkling_ctrl_down_f32(params, dst); break;
         case GGML_INKLING_CTRL_GATE: ggml_inkling_ctrl_gate_f32(params, dst); break;
         case GGML_INKLING_CONV_STATE: ggml_inkling_conv_state_f32(params, dst); break;
+        case GGML_INKLING_MOE_SUM: ggml_inkling_moe_sum_f32(params, dst); break;
         default: GGML_ABORT("unknown inkling op");
     }
 }

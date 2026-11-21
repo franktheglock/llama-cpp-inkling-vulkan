@@ -2341,6 +2341,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // Inkling 2: the per-expert scales folded into the SITU and combine kernels, no repeat/get_rows/mul/add chains
+    if (arch == LLM_ARCH_INKLING2 && gate_up_exps && type_op == LLM_FFN_SITU && !weight_before_ffn &&
+        !gate_up_exps_b && !down_exps_b && getenv("INKLING_UNFUSED") == nullptr) {
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, nullptr); // [n_ff*2, n_expert_used, n_tokens]
+        cb(gate_up, "ffn_moe_gate_up", il);
+        ggml_tensor * act = ggml_inkling_situ_scaled(ctx0, gate_up, selected_experts, up_exps_s, hparams.situ_beta, hparams.situ_linear_beta);
+        cb(act, "ffn_moe_situ", il);
+        ggml_tensor * ex = build_lora_mm_id(down_exps, act, selected_experts, nullptr); // [n_embd, n_expert_used, n_tokens]
+        cb(ex, "ffn_moe_down", il);
+        ggml_tensor * moe = ggml_inkling_moe_sum(ctx0, ex, weights, down_exps_s ? selected_experts : nullptr, down_exps_s);
+        cb(moe, "ffn_moe_out", il);
+        return moe;
+    }
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]

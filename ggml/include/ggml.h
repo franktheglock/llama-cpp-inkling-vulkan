@@ -2649,6 +2649,7 @@ extern "C" {
         GGML_INKLING_RELBIAS = 6, // like RELMASK, the bias computed from the rel_bias weight and r: sum_r w[r, rel_pos]*r[r, h, t]
         GGML_INKLING_CTRL_DOWN = 7, // h = D [rms(cur); rms(msg)]
         GGML_INKLING_CTRL_GATE = 8, // (1 - tanh(F h))*cur + tanh(G h)*msg
+        GGML_INKLING_MOE_SUM  = 10, // out[:, t] = sum_e w[e, t]*scale[ids[e, t]]*y[:, e, t]
         GGML_INKLING_CONV_STATE = 9, // CONV reading the history and the input directly, writing the new conv state
         GGML_INKLING_SITU    = 5, // MoE SITU on a merged [gate | up] row: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)
     };
@@ -2743,7 +2744,24 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * gate_up,
             float                 beta,
-            float                 linear_beta);        // NULL = no InnerQ scaling
+            float                 linear_beta);
+
+    // as ggml_inkling_situ, each [gate | up] row (e, t) first multiplied by scale[ids[e, t]] (gate_up: [2*n_ff, n_used, T])
+    GGML_API struct ggml_tensor * ggml_inkling_situ_scaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate_up,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * scale,
+            float                 beta,
+            float                 linear_beta);
+
+    // y: [n, n_used, T] f32 contiguous; w: [1, n_used, T] f32; ids: [n_used, T] i32 or NULL; scale: [n_expert] f32 or NULL
+    GGML_API struct ggml_tensor * ggml_inkling_moe_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * y,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
 
     // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(
