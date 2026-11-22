@@ -1,4 +1,72 @@
-# llama.cpp
+# llama.cpp — Inkling 2 Mini on Vulkan
+
+> **This fork** is based on [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) and adds
+> fast **Inkling 2 Mini** inference on the **Vulkan** backend. It was developed and tested on an
+> **AMD Radeon Pro V620 (32 GB, RDNA2, RADV)**. Everything below the next horizontal rule is the stock llama.cpp README.
+
+## What this fork adds
+
+- **Inkling 2 support**, ported from upstream (#32217, #32294, #32381, #32429, #32657, #32695), including the looped Mini model.
+- **Fused Vulkan kernels for Inkling 2.**
+  - A `GGML_OP_INKLING` family that fuses clip, mix, conv+state, gates, rel-mask, loop controllers and SITU.
+  - The q|k|v|rel|gate projections are merged.
+  - Fused MoE kernels: router (ids + weights), expert scales and combine.
+  - KV mega-kernels.
+- **DSpark speculative decoding**: `--spec-type draft-dspark`, including drafting across image chunks.
+- **Vision** through the `inkling2v` mmproj projector.
+- **GPU (backend) sampling**, which stays on the GPU for tool-calling requests until a lazy grammar actually triggers.
+- **Prompt-cache reuse** for hybrid recurrent+SWA memory in `llama-server`. Follow-up turns go from ~80 s to ~1.4 s at long context.
+- **The relative-position bias as an indexed bias inside flash attention**, adapted from upstream #32740. This avoids a dense mask at long context.
+
+## Performance (Radeon Pro V620, Inkling-2-Mini-UD-Q4_K_XL, 262k ctx, q8_0/q8_0 KV)
+
+| | Prefill | Decode |
+|---|---|---|
+| Target only, short prompt | – | ~67 t/s |
+| DSpark, short prompt | – | 60–90 t/s (depends on draft acceptance) |
+| DSpark, 29k-token prompt | ~650 t/s | ~76 t/s |
+| DSpark, 224k-token prompt | ~220 t/s | ~36 t/s |
+
+VRAM use with the DSpark draft and the F16 mmproj loaded is about 26.4 GB, plus about 2.6 GB in system RAM.
+
+## Build
+
+```bash
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
+```
+
+## Run
+
+These files go together:
+- `Inkling-2-Mini-UD-Q4_K_XL.gguf`: the model.
+- `dspark-Inkling-2-Mini-Q8_0.gguf`: the DSpark draft.
+- `mmproj-F16.gguf`: the vision projector.
+
+```bash
+# On systems with several Vulkan ICDs, pin RADV:
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
+
+./build/bin/llama-server \
+  -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
+  --mmproj mmproj-F16.gguf \
+  --spec-type draft-dspark --spec-draft-model dspark-Inkling-2-Mini-Q8_0.gguf --spec-draft-n-max 3 \
+  -c 262144 -b 16384 -ub 1024 \
+  -ctk q8_0 -ctv q8_0 -fa on -ngl 99 \
+  --parallel 1 --backend-sampling --reasoning on
+```
+
+Tips:
+- **Keep the micro-batch (`-ub`) at 1024 or lower on a 32 GB card.** At 2048 the compute buffers push VRAM past capacity, and long prompts then hang the GPU ("ring timeout").
+- **Leave the V cache at q8_0.** In testing, q4_1 V saved only ~0.9 GB and cut decode speed by 10–15%.
+- **`-b 16384` costs no extra memory.** Memory is set by `-ub`.
+- **`INKLING_FUSED_MASK=255`** switches back to the old dense-mask attention path for comparison.
+
+Known slow spots:
+- The NVFP4 MoE prefill kernels.
+- Flash attention in the global layers at very long context.
+
+---
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
