@@ -11271,13 +11271,23 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
 
+    // AMD RDNA3/4 benefits from higher split_k occupancy on long-KV decode.
+    // GGML_VK_FA_SPLIT_K_MULT overrides the multiplier for A/B tuning.
+    static const uint32_t fa_split_k_mult_env = []() -> uint32_t {
+        const char * env = getenv("GGML_VK_FA_SPLIT_K_MULT");
+        return env ? (uint32_t) std::max(1, atoi(env)) : 0u;
+    }();
+    const uint32_t fa_split_k_mult =
+        (fa_split_k_mult_env > 0 && N == 1 && KV >= 4096) ? fa_split_k_mult_env :
+        (ctx->device->vendor_id == VK_VENDOR_ID_AMD && N == 1 && KV >= 4096) ? 8u : 2u;
+
     // Try to use split_k when KV is large enough to be worth the overhead.
     if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+        split_k = shader_core_count * fa_split_k_mult / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
+        if (total_wgs_no_split < shader_core_count * fa_split_k_mult) {
+            split_k = shader_core_count * fa_split_k_mult / total_wgs_no_split;
         }
     }
 
