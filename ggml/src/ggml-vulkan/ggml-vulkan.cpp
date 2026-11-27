@@ -11170,17 +11170,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16 ||
                         ggml_is_quantized(k->type) || ggml_is_quantized(v->type);
 
-    // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
-    // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
-    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k->type, v->type, f32acc);
-    const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
-
     // indexed bias (Inkling relative-position bias): table [n_bins, n_head, n_query], indices [KV, n_query]
     const ggml_tensor * bias_table = dst->src[5];
     const ggml_tensor * bias_idx   = dst->src[6];
     const bool          has_bias   = bias_table != nullptr && ggml_flash_attn_ext_has_indexed_bias(dst);
 
-    if (!has_bias && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
+    // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
+    vk_fa_tuning_params tuning_params = has_bias
+        ? get_fa_tuning_params_scalar(ctx->device, HSK, HSV, 512, KV, k->type, v->type, f32acc)
+        : get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k->type, v->type, f32acc);
+    const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+
+    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -11228,8 +11230,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    // (the mask opt bits describe the mask alone, the bias makes them wrong)
-    bool use_mask_opt = !has_bias && mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    // With indexed bias, mask_opt is still used to skip ALL_NEG_INF tiles and omit data_m loads on ALL_ZERO tiles.
+    bool use_mask_opt = mask && (!has_bias || gqa_ratio == 1) && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k->type, v->type);

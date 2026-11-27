@@ -277,6 +277,18 @@ void init_indices()
     m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
 }
 
+// Flattened query and Q head of tile row r. With GQA collapse rows are heads. False for padding rows.
+bool fa_bias_row(const in uint32_t r, out uint32_t query, out uint32_t head) {
+    if (p.gqa_ratio > 1) {
+        query = iq3 * p.ne2 + gqa_iq1;
+        head  = iq2 + r;
+        return r < N;
+    }
+    query = iq3 * p.ne2 + i * Br + r;
+    head  = iq2;
+    return i * Br + r < N;
+}
+
 // Bias applied to softmax to stay in fp16 range.
 // Based on ggml-cuda issue https://github.com/ggml-org/llama.cpp/issues/18606
 const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;

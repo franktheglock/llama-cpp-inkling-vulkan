@@ -34,6 +34,7 @@ const uint32_t rows_per_thread = Br / row_split;
 const uint32_t cols_per_iter = WorkGroupSize / D_split / row_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
 const uint32_t num_subgroups = SubGroupSize == 0 ? 0 : WorkGroupSize / SubGroupSize;
+const uint32_t mask_iters = (Bc * Br + WorkGroupSize - 1) / WorkGroupSize;
 
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
@@ -212,28 +213,51 @@ void main() {
                 // skip this block
                 continue;
             }
-            // Only load if the block is not all zeros
-            if (mask_opt_bits != MASK_OPT_ALL_ZERO) {
+            // Skip all-zero blocks unless a bias has to be staged
+            if (mask_opt_bits != MASK_OPT_ALL_ZERO || INDEXED_BIAS) {
+                const bool mask_zero = INDEXED_BIAS && mask_opt_bits == MASK_OPT_ALL_ZERO;
                 bool nem1_bounds_check = !(p.gqa_ratio > 1) && (p.nem1 % Br) != 0;
 
                 float max_mask = NEG_FLT_MAX_OVER_2;
+
+                // Bias: issue mask, index and table loads before the barrier so they overlap with waiting
+                FLOAT_TYPE mb[mask_iters];
+                if (INDEXED_BIAS) {
+                    bool mact[mask_iters], bact[mask_iters];
+                    FLOAT_TYPE mv[mask_iters];
+                    uint32_t bin_base[mask_iters];
+                    uint32_t bin[mask_iters];
+                    [[unroll]] for (uint32_t it = 0; it < mask_iters; ++it) {
+                        const uint32_t c = (it * WorkGroupSize + tid) % Bc;
+                        const uint32_t r = (it * WorkGroupSize + tid) / Bc;
+                        const uint32_t kcol = j * Bc + c;
+                        uint32_t bq, bh;
+                        mact[it] = it * WorkGroupSize + tid < Bc * Br &&
+                                   (!KV_bounds_check || kcol < KV) &&
+                                   (!nem1_bounds_check || i * Br + r < p.nem1);
+                        bact[it] = fa_bias_row(r, bq, bh) && mact[it];
+                        mv[it] = mask_zero ? FLOAT_TYPE(0.0) :
+                                 FLOAT_TYPE(data_m[mact[it] ? m_offset + (i * Br + r) * m_stride + kcol : 0]);
+                        bin_base[it] = (bq * p.neq2 + bh) * BIAS_N_BINS;
+                        bin[it] = uint32_t(data_bias_idx[bact[it] ? bq * KV + kcol : 0]);
+                    }
+                    [[unroll]] for (uint32_t it = 0; it < mask_iters; ++it) {
+                        const bool valid_bin = bact[it] && bin[it] < BIAS_N_BINS;
+                        const float t = data_bias_table[valid_bin ? bin_base[it] + bin[it] : 0];
+                        const float m = mask_zero ? 0.0f : float(mv[it]);
+                        mb[it] = FLOAT_TYPE(valid_bin ? m + t : m);
+                        max_mask = mact[it] ? max(max_mask, float(mb[it])) : max_mask;
+                    }
+                }
+
                 barrier();
-                [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += gl_WorkGroupSize.x) {
+                [[unroll]] for (uint32_t it = 0; it < mask_iters; ++it) {
+                    const uint32_t idx = it * WorkGroupSize;
                     uint32_t c = (idx + tid) % Bc;
                     uint32_t r = (idx + tid) / Bc;
                     if (idx + tid < Bc * Br) {
                         if ((!KV_bounds_check || j * Bc + c < KV) && (!nem1_bounds_check || i * Br + r < p.nem1)) {
-                            FLOAT_TYPE m = FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
-                            if (INDEXED_BIAS && i * Br + r < p.N) {
-                                const uint32_t query = iq3 * p.N + i * Br + r;
-                                const uint32_t bin   = uint32_t(data_bias_idx[query * KV + j * Bc + c]);
-                                if (bin < BIAS_N_BINS) {
-                                    // same F16 rounding as a materialized mask
-                                    const float mb = float(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]) +
-                                            data_bias_table[(query * p.neq2 + iq2) * BIAS_N_BINS + bin];
-                                    m = FLOAT_TYPE(unpackHalf2x16(packHalf2x16(vec2(mb, 0.0))).x);
-                                }
-                            }
+                            FLOAT_TYPE m = INDEXED_BIAS ? mb[it] : FLOAT_TYPE(data_m[m_offset + (i * Br + r) * m_stride + (j * Bc + c)]);
                             masksh[c * masksh_stride + r] = m;
                             max_mask = max(max_mask, float(m));
                         } else {
@@ -466,7 +490,7 @@ void main() {
             }
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        if (MASK_ENABLE && (mask_opt_bits != MASK_OPT_ALL_ZERO || INDEXED_BIAS)) {
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];
